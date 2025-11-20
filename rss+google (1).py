@@ -679,13 +679,7 @@ os.environ["OPENAI_API_KEY"] = "-----------------"
 #     run_app()
 #
 
-!ngrok config add-authtoken 35kwRqXvTul9wnIQ5RAsSNWXgbu_3WRiffeDz1VHNhs4XhSCW
 
-from pyngrok import ngrok
-public_url = ngrok.connect(8501)
-print("Public URL:", public_url)
-
-!rm news_articles.db
 
 !pip install plotly
 
