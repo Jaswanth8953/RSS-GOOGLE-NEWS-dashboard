@@ -7,3 +7,5 @@ transformers
 openai
 requests
 beautifulsoup4
+gnews
+plotly
