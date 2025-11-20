@@ -7,7 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/1hNjOXzMIM-V6lUQkUqvcN-lCxSRSFoey
 """
 
-!pip install feedparser openai transformers torch pandas numpy streamlit pyngrok
 
 !pip install streamlit openai transformers torch feedparser plotly gnews requests
 
