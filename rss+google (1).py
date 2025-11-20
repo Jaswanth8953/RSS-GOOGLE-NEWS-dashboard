@@ -8,7 +8,6 @@ Original file is located at
 """
 
 
-!pip install streamlit openai transformers torch feedparser plotly gnews requests
 
 import os
 os.environ["OPENAI_API_KEY"] = "-----------------"
