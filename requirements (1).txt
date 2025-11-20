@@ -1,0 +1,9 @@
+streamlit==1.30.0
+pandas
+numpy
+feedparser
+torch
+transformers
+openai
+requests
+beautifulsoup4
