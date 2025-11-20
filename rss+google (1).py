@@ -12,7 +12,7 @@ Original file is located at
 import os
 os.environ["OPENAI_API_KEY"] = "-----------------"
 
-!mkdir project
+
 
 # Commented out IPython magic to ensure Python compatibility.
 # %%writefile project/app.py
