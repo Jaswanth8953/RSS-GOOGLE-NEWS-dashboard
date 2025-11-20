@@ -679,8 +679,3 @@ os.environ["OPENAI_API_KEY"] = "-----------------"
 
 
 
-!pip install plotly
-
-!sed -n '140,220p' project/app.py
-
-!streamlit run project/app.py --server.port=8501 --server.address=0.0.0.0
