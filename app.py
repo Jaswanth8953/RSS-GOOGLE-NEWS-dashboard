@@ -511,7 +511,7 @@ Articles:
         if not isinstance(selected_ids, list):
             return df
         selected_ids = set(int(i) for i in selected_ids)
-        return df[df["id"].isin(selected_ids]]
+        return df[df["id"].isin(selected_ids)]
     except Exception:
         # if anything goes wrong, just return original df
         return df
