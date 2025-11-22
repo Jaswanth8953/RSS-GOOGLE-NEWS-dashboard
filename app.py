@@ -1,12 +1,9 @@
-# app.py  -- Final "A version" refactor
-# RSS + GDELT + GNews -> Hybrid + LLM Query Expansion + LLM Article Filter -> FinBERT sentiment
-
 import os
 import json
 import sqlite3
 import time
 import datetime as dt
-from typing import List, Tuple, Iterable
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,22 +39,15 @@ RSS_FEEDS = [
 OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
-MIN_SIMILARITY = 0.30         # semantic threshold
-MAX_ARTICLES_DEFAULT = 200    # after all filtering
-GDELT_MAX_RECORDS = 200
-GNEWS_MAX_RESULTS = 150
-
-# Safety caps so you don’t overwhelm OpenAI or DB in one run
-MAX_ARTICLES_FOR_LLM_FILTER = 220
-MAX_ARTICLES_FOR_SENTIMENT = 500
-EMBED_BATCH_SIZE = 64
-FINBERT_BATCH_SIZE = 32
+MIN_SIMILARITY = 0.30          # a bit lower → more matches
+MAX_ARTICLES_DEFAULT = 200
+GDELT_MAX_RECORDS = 250
+GNEWS_MAX_RESULTS = 200
 
 
-# ========================== DB SETUP (LOCK-FRIENDLY) ==========================
+# ========================== DB SETUP (LOCK-FREE) ==========================
 
-
-def get_connection() -> sqlite3.Connection:
+def get_connection():
     """
     Single shared SQLite connection.
     WAL mode + timeout to avoid 'database is locked'.
@@ -65,14 +55,14 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(
         DB_PATH,
         check_same_thread=False,
-        timeout=30,  # wait up to 30s if locked
+        timeout=30  # wait up to 30s if locked
     )
 
     # WAL mode allows concurrent reads/writes
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA cache_size = -20000;")  # memory cache
+    conn.execute("PRAGMA cache_size = -20000;")  # use memory cache
 
     conn.execute(
         """
@@ -84,7 +74,7 @@ def get_connection() -> sqlite3.Connection:
             link TEXT UNIQUE,
             source TEXT,
             content TEXT,
-            embedding TEXT   -- JSON list of floats
+            embedding TEXT
         );
         """
     )
@@ -95,9 +85,9 @@ def get_connection() -> sqlite3.Connection:
 conn = get_connection()
 
 
-def safe_execute(query: str, params: tuple = ()) -> sqlite3.Cursor:
+def safe_execute(query: str, params: tuple = ()):
     """
-    Wrapper for INSERT/UPDATE with retry if DB is locked.
+    Safer wrapper for INSERT/UPDATE with retry if DB is locked.
     """
     max_retries = 10
     for attempt in range(max_retries):
@@ -112,26 +102,23 @@ def safe_execute(query: str, params: tuple = ()) -> sqlite3.Cursor:
                 time.sleep(0.5)
                 continue
             raise
-    raise RuntimeError("Database write failed after multiple retries")
+    raise Exception("Database write failed after multiple retries")
 
 
 # ========================== OPENAI CLIENT ==========================
 
-
 @st.cache_resource
-def get_openai_client() -> OpenAI:
+def get_openai_client():
     """
-    OpenAI client using Streamlit secrets.
-    In Streamlit Cloud, set:
-      [openai]
-      api_key = "sk-..."
+    Uses Streamlit secrets:
+    [openai]
+    api_key = "sk-...."
     """
     api_key = st.secrets["openai"]["api_key"]
     return OpenAI(api_key=api_key)
 
 
 # ========================== FINBERT SENTIMENT ==========================
-
 
 @st.cache_resource
 def load_finbert():
@@ -143,88 +130,40 @@ def load_finbert():
     return tokenizer, model, device
 
 
-def _calibrated_label(probs: np.ndarray) -> str:
-    """
-    Apply a small calibration so we don't get 99% positive all the time.
-    FinBERT original label mapping:
-        0 -> negative, 1 -> neutral, 2 -> positive
-    """
-    neg_p, neu_p, pos_p = probs[0], probs[1], probs[2]
-    max_p = probs.max()
-    idx = int(np.argmax(probs))
-    base_label = {0: "negative", 1: "neutral", 2: "positive"}[idx]
-
-    # If model is unsure, treat as neutral
-    if max_p < 0.55:
-        return "neutral"
-
-    # Soften over-confident positives/negatives when others are close
-    if base_label == "positive":
-        if pos_p < 0.60 and (neg_p > 0.15 or neu_p > 0.25):
-            return "neutral"
-    if base_label == "negative":
-        if neg_p < 0.60 and (pos_p > 0.15 or neu_p > 0.25):
-            return "neutral"
-
-    return base_label
-
-
 def finbert_sentiment(texts: List[str]) -> List[dict]:
-    """
-    Run FinBERT in batches with calibration to avoid extreme bias.
-    """
     if not texts:
         return []
-
     tokenizer, model, device = load_finbert()
-    results: List[dict] = []
+    enc = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=256,
+        return_tensors="pt",
+    ).to(device)
 
-    for i in range(0, len(texts), FINBERT_BATCH_SIZE):
-        batch = texts[i: i + FINBERT_BATCH_SIZE]
-        enc = tokenizer(
-            batch,
-            padding=True,
-            truncation=True,
-            max_length=256,
-            return_tensors="pt",
-        ).to(device)
+    with torch.no_grad():
+        outputs = model(**enc)
+        probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
 
-        with torch.no_grad():
-            outputs = model(**enc)
-            probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
-
-        for p in probs:
-            label = _calibrated_label(p)
-            score = float(p.max())
-            results.append({"label": label, "score": score})
-
+    id2label = {0: "negative", 1: "neutral", 2: "positive"}
+    results = []
+    for p in probs:
+        idx = int(np.argmax(p))
+        results.append({"label": id2label[idx], "score": float(p[idx])})
     return results
 
 
 # ========================== EMBEDDINGS ==========================
-
 
 def get_embedding(text: str) -> List[float]:
     client = get_openai_client()
     text = text.replace("\n", " ")
     emb = client.embeddings.create(
         model=OPENAI_EMBED_MODEL,
-        input=text,
+        input=text
     )
     return emb.data[0].embedding
-
-
-def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
-    """
-    Batched embeddings to reduce overhead.
-    """
-    client = get_openai_client()
-    cleaned = [t.replace("\n", " ") for t in texts]
-    resp = client.embeddings.create(
-        model=OPENAI_EMBED_MODEL,
-        input=cleaned,
-    )
-    return [d.embedding for d in resp.data]
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -235,7 +174,6 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ========================== RSS INGESTION ==========================
-
 
 def parse_rss(url: str) -> List[dict]:
     feed = feedparser.parse(url)
@@ -301,11 +239,9 @@ def fetch_rss_articles() -> int:
 
 # ========================== GDELT INGESTION ==========================
 
-
 def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
     """
     Pulls articles from GDELT 2.0 DOC API for a given query and date range.
-    Used mainly to enrich DB; not all will be used in final analysis.
     """
     new_count = 0
 
@@ -356,8 +292,7 @@ def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
     return new_count
 
 
-# ========================== GOOGLE NEWS INGESTION ==========================
-
+# ========================== GOOGLE NEWS (GNews) ==========================
 
 def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
     new_count = 0
@@ -402,7 +337,6 @@ def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
 
 # ========================== EMBEDDING MANAGEMENT ==========================
 
-
 def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     cur = conn.cursor()
     cur.execute(
@@ -415,18 +349,7 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     )
     rows = cur.fetchall()
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "id",
-                "title",
-                "summary",
-                "published",
-                "link",
-                "source",
-                "content",
-                "embedding",
-            ]
-        )
+        return pd.DataFrame()
     df = pd.DataFrame(
         rows,
         columns=[
@@ -443,175 +366,217 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     return df
 
 
-def ensure_embeddings_for_subset(df_subset: pd.DataFrame) -> None:
+def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
     """
-    Compute embeddings only for the subset of rows we actually care about.
-    Use batched OpenAI calls and safe DB updates.
+    Add embeddings for rows that don't have them yet.
+    Uses safe_execute to avoid DB locking.
     """
-    missing = df_subset[df_subset["embedding"].isna() | (df_subset["embedding"] == "")]
-    if missing.empty:
-        return
-
-    texts = [
-        ((row["title"] or "") + " " + (row["summary"] or "")).strip()
-        for _, row in missing.iterrows()
-    ]
-    valid_indices = [i for i, t in enumerate(texts) if t]
-
-    for i_start in range(0, len(valid_indices), EMBED_BATCH_SIZE):
-        idxs = valid_indices[i_start: i_start + EMBED_BATCH_SIZE]
-        batch_texts = [texts[i] for i in idxs]
-        try:
-            batch_embs = get_embeddings_batch(batch_texts)
-        except Exception:
-            # fall back to single calls if batch fails
-            batch_embs = [get_embedding(t) for t in batch_texts]
-
-        for local_idx, emb in zip(idxs, batch_embs):
-            row_id = int(missing.iloc[local_idx]["id"])
+    for _, row in df_ids_title_summary.iterrows():
+        if row["embedding"] is None:
+            text = (row["title"] or "") + " " + (row["summary"] or "")
+            if not text.strip():
+                continue
+            emb = get_embedding(text)
             safe_execute(
                 "UPDATE articles SET embedding = ? WHERE id = ?",
-                (json.dumps(emb), row_id),
+                (json.dumps(emb), int(row["id"])),
             )
 
 
+# ---------- OLD single-query hybrid search (kept for reference, not used) --
+
 def hybrid_search(
     query: str,
-    keyword_terms: List[str],
     start: dt.date,
     end: dt.date,
     top_k: int,
     min_sim: float = MIN_SIMILARITY,
 ) -> pd.DataFrame:
     """
-    Hybrid keyword + semantic search within date range.
-
-    IMPORTANT CHANGE vs old code:
-    - We use ONE semantic vector (for the ORIGINAL query)
-      so results are centered on that query.
-    - keyword_terms (expanded terms) are used only for keyword filtering,
-      not for separate semantic searches, which makes "US Tech" / "Nvidia"
-      / "Technology" behaviour more consistent.
+    Single-query hybrid search (kept for reference). Not used in the main app.
     """
     df = load_articles_for_range(start, end)
     if df.empty:
         return df
 
-    # Normalize embedding column to None when empty
     df["embedding"] = df["embedding"].apply(
         lambda x: None if x in (None, "", "NULL") else x
     )
 
-    # ---------- 1) KEYWORD FILTER (OR across all expanded terms) ----------
-    if keyword_terms:
-        kws = [k.lower().strip() for k in keyword_terms if k.strip()]
-        mask_kw = np.zeros(len(df), dtype=bool)
-        for term in kws:
-            if not term:
-                continue
-            contains = (
-                df["title"].str.lower().str.contains(term, na=False)
-                | df["summary"].str.lower().str.contains(term, na=False)
-                | df["content"].str.lower().str.contains(term, na=False)
-            )
-            mask_kw |= contains
-        df = df[mask_kw].copy()
+    ensure_embeddings(df[["id", "title", "summary", "embedding"]])
 
-    # Limit how many docs we even consider for embeddings
-    df = df.sort_values("published", ascending=False).head(
-        max(top_k * 4, 800)
-    ).reset_index(drop=True)
-
+    df = load_articles_for_range(start, end)
     if df.empty:
         return df
 
-    # ---------- 2) EMBEDDINGS FOR THIS SUBSET ----------
-    ensure_embeddings_for_subset(df)
-
-    # Reload subset with embeddings filled
-    ids = tuple(int(x) for x in df["id"].tolist())
-    cur = conn.cursor()
-    cur.execute(
-        f"""
-        SELECT id, title, summary, published, link, source, content, embedding
-        FROM articles
-        WHERE id IN ({",".join("?" for _ in ids)})
-        """,
-        ids,
-    )
-    rows = cur.fetchall()
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "id",
-            "title",
-            "summary",
-            "published",
-            "link",
-            "source",
-            "content",
-            "embedding",
-        ],
-    )
-
-    if df.empty:
-        return df
-
-    # ---------- 3) SEMANTIC SIMILARITY ----------
     q_emb = np.array(get_embedding(query))
     sims = []
     for _, row in df.iterrows():
-        try:
-            emb_vec = np.array(json.loads(row["embedding"]))
-        except Exception:
-            sims.append(0.0)
-            continue
+        emb_vec = np.array(json.loads(row["embedding"]))
         sims.append(cosine_similarity(q_emb, emb_vec))
     df["similarity"] = sims
 
+    q_lower = query.lower().strip()
+    kw_mask = (
+        df["title"].str.lower().str.contains(q_lower, na=False)
+        | df["summary"].str.lower().str.contains(q_lower, na=False)
+        | df["content"].str.lower().str.contains(q_lower, na=False)
+    )
+
     sem_mask = df["similarity"] >= min_sim
-    if not sem_mask.any():
-        # no strong semantic hits → still return the best few by similarity
-        df["match_type"] = "keyword_only"
-        return df.sort_values("similarity", ascending=False).head(top_k)
 
-    df_sem = df[sem_mask].copy()
-    df_sem["match_type"] = "keyword+semantic"
+    if kw_mask.any() and sem_mask.any():
+        mask = kw_mask & sem_mask
+        df["match_type"] = np.where(
+            mask,
+            "keyword+semantic",
+            np.where(kw_mask, "keyword", "semantic"),
+        )
+        filtered = df[kw_mask | sem_mask]
+    elif kw_mask.any():
+        df["match_type"] = "keyword"
+        filtered = df[kw_mask]
+    elif sem_mask.any():
+        df["match_type"] = "semantic"
+        filtered = df[sem_mask]
+    else:
+        return pd.DataFrame()
 
-    # Prioritize semantic similarity but keep recency a bit
-    df_sem = df_sem.sort_values(
-        ["similarity", "published"], ascending=[False, False]
-    ).head(top_k)
+    filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
+    return filtered
 
-    return df_sem.reset_index(drop=True)
+
+# ---------- NEW semantic-first multi-query hybrid search (OPTION A) ------
+
+def semantic_search_multi(
+    queries: List[str],
+    start: dt.date,
+    end: dt.date,
+    top_k: int,
+    min_sim: float = MIN_SIMILARITY,
+) -> pd.DataFrame:
+    """
+    Semantic-first hybrid search using ALL expanded queries together.
+    1. Ensure embeddings for all articles in the date range.
+    2. Compute embeddings for all expanded queries and average them.
+    3. Rank articles by cosine similarity to the averaged query embedding.
+    4. Apply a small boost for keyword matches and keep top_k.
+    """
+
+    df = load_articles_for_range(start, end)
+    if df.empty:
+        return df
+
+    # Normalise embedding column
+    df["embedding"] = df["embedding"].apply(
+        lambda x: None if x in (None, "", "NULL") else x
+    )
+
+    # Ensure every article has an embedding
+    ensure_embeddings(df[["id", "title", "summary", "embedding"]])
+
+    # Reload to get fresh embeddings
+    df = load_articles_for_range(start, end)
+    if df.empty:
+        return df
+
+    # Build article embedding matrix
+    emb_list = []
+    valid_idx = []
+    for idx, row in df.iterrows():
+        try:
+            vec = np.array(json.loads(row["embedding"]), dtype=float)
+            emb_list.append(vec)
+            valid_idx.append(idx)
+        except Exception:
+            emb_list.append(None)
+
+    if not emb_list:
+        return pd.DataFrame()
+
+    emb_mat = np.vstack([e for e in emb_list if e is not None])
+    article_norms = np.linalg.norm(emb_mat, axis=1)
+    article_norms[article_norms == 0] = 1e-8
+
+    # Build combined query embedding (average of all expanded queries)
+    clean_queries = [q.strip() for q in queries if q and q.strip()]
+    if not clean_queries:
+        return pd.DataFrame()
+
+    q_vecs = []
+    for q in clean_queries:
+        q_vecs.append(np.array(get_embedding(q), dtype=float))
+    q_mat = np.vstack(q_vecs)
+    q_mean = q_mat.mean(axis=0)
+    q_norm = np.linalg.norm(q_mean)
+    if q_norm == 0:
+        q_norm = 1e-8
+
+    # Cosine similarities
+    sims = (emb_mat @ q_mean) / (article_norms * q_norm)
+
+    # Put similarities back into df
+    df = df.iloc[valid_idx].copy()
+    df["similarity"] = sims
+
+    # Keyword mask over ALL queries
+    q_terms = [q.lower() for q in clean_queries]
+
+    def contains_any(text: str) -> bool:
+        t = (text or "").lower()
+        return any(term in t for term in q_terms)
+
+    kw_mask = (
+        df["title"].apply(contains_any)
+        | df["summary"].apply(contains_any)
+        | df["content"].apply(contains_any)
+    )
+
+    # Semantic mask
+    sem_mask = df["similarity"] >= min_sim
+
+    # Give a small boost to articles that also match keywords
+    df.loc[kw_mask, "similarity"] = df.loc[kw_mask, "similarity"] + 0.05
+
+    # Decide which rows to keep
+    base_mask = sem_mask | kw_mask
+    if base_mask.any():
+        filtered = df[base_mask].copy()
+        filtered["match_type"] = np.where(
+            kw_mask[base_mask] & sem_mask[base_mask],
+            "keyword+semantic",
+            np.where(kw_mask[base_mask], "keyword", "semantic"),
+        )
+    else:
+        # Fallback: just take best semantic matches
+        filtered = df.copy()
+        filtered["match_type"] = "semantic"
+
+    filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
+    return filtered
 
 
 # ========================== LLM QUERY EXPANSION ==========================
 
-
 def expand_query_with_llm(query: str) -> List[str]:
     """
     Use LLM to generate related terms for the user's query.
-
-    NEW PROMPT:
-    - Ask for synonyms / near-synonyms only
-    - Avoid extremely broad categories ("technology" -> "business", "economy")
-      so that US Tech vs Nvidia vs Technology feel more balanced.
+    This is what helps fix US Tech vs Nvidia vs Technology differences.
     """
     client = get_openai_client()
 
     prompt = f"""
-You expand financial news search queries.
+You are helping expand a financial news search query.
 
-Original user query: "{query}"
+Original query: "{query}"
 
-Return 6–10 SHORT alternative search terms that:
-- are close synonyms or near-synonyms
-- include important related entities or tickers
-- avoid extremely broad categories
-- avoid unrelated buzzwords
+Generate 8-12 alternative search terms that:
+- mean the same
+- are closely related industries
+- include broader and narrower concepts
+- include common synonyms
 
-Return ONLY a valid JSON list of strings, for example:
+Return ONLY a valid JSON list of strings, like:
 ["term1", "term2", "term3"]
 """
 
@@ -619,10 +584,7 @@ Return ONLY a valid JSON list of strings, for example:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a precise assistant that creates compact, finance-focused query expansions.",
-                },
+                {"role": "system", "content": "You generate semantic search expansions."},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -630,43 +592,30 @@ Return ONLY a valid JSON list of strings, for example:
         expansions = json.loads(content)
         expansions = [str(t) for t in expansions if isinstance(t, str)]
         # always include original query as first term
-        all_terms = [query] + [t for t in expansions if t.strip()]
-        # de-duplicate while preserving order
-        seen = set()
-        unique_terms = []
-        for t in all_terms:
-            if t.lower() not in seen:
-                seen.add(t.lower())
-                unique_terms.append(t)
-        return unique_terms
+        return [query] + expansions
     except Exception:
         return [query]
 
 
 # ========================== LLM ARTICLE SELECTION ==========================
 
-
 def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
     """
     Let the LLM decide which of the already-matched articles
     are truly relevant to the user's topic.
-
-    We send only (id, title, summary) and cap to MAX_ARTICLES_FOR_LLM_FILTER.
+    We send only (id, title, summary) to the LLM to keep it light.
     """
     if df.empty:
         return df
 
     client = get_openai_client()
 
-    df = df.sort_values("similarity", ascending=False).head(
-        MAX_ARTICLES_FOR_LLM_FILTER
-    )
-
+    # Prepare lightweight list
     items = [
         {
             "id": int(row["id"]),
             "title": row["title"],
-            "summary": (row["summary"] or "")[:260],
+            "summary": (row["summary"] or "")[:250],
         }
         for _, row in df.iterrows()
     ]
@@ -676,12 +625,11 @@ You are an article relevance filter for a financial news dashboard.
 
 The user topic is: "{query}"
 
-Below is a list of candidate articles (ID, title, summary).
-Select the ones that are truly relevant to this topic
-and discard off-topic or weak matches.
+Below is a list of articles with IDs, titles, and summaries.
 
+Decide which articles are truly relevant to this topic.
 Return ONLY a JSON list of the IDs to KEEP.
-No explanation text.
+Do NOT include any explanation text, just the JSON list.
 
 Articles:
 {json.dumps(items, indent=2)}
@@ -691,10 +639,7 @@ Articles:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You select relevant financial news articles and respond only with JSON.",
-                },
+                {"role": "system", "content": "You select relevant financial news articles."},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -703,16 +648,13 @@ Articles:
         if not isinstance(selected_ids, list):
             return df
         selected_ids = set(int(i) for i in selected_ids)
-        filtered = df[df["id"].isin(selected_ids)].copy()
-        if filtered.empty:
-            return df
-        return filtered
+        return df[df["id"].isin(selected_ids)]
     except Exception:
+        # if anything goes wrong, just return original df
         return df
 
 
 # ========================== KEYWORDS & SENTIMENT INDEX ==========================
-
 
 def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]]:
     text = " ".join(titles).lower()
@@ -745,13 +687,6 @@ def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]
         "through",
         "within",
         "without",
-        "company",
-        "companies",
-        "market",
-        "markets",
-        "stock",
-        "stocks",
-        "news",
     }
     words = [w for w in words if w not in stop]
     counter = Counter(words)
@@ -770,7 +705,6 @@ def calculate_sentiment_index(df: pd.DataFrame) -> float:
 
 # ========================== STREAMLIT APP ==========================
 
-
 def run_app():
     st.set_page_config(
         page_title="Financial News Sentiment Dashboard",
@@ -781,9 +715,7 @@ def run_app():
     # Title
     st.title("📈 Financial News Sentiment Dashboard")
     st.markdown(
-        "RSS + Google News + GDELT → "
-        "**Hybrid + LLM Query Expansion + LLM Article Selection** → "
-        "FinBERT Sentiment (Calibrated)"
+        "RSS + Google News + GDELT → **Hybrid + LLM Query Expansion + LLM Article Selection** → FinBERT Sentiment"
     )
 
     # Sidebar toggle (optional)
@@ -808,7 +740,7 @@ def run_app():
             unsafe_allow_html=True,
         )
 
-    # ------------------------ SIDEBAR ------------------------ #
+    # SIDEBAR
     with st.sidebar:
         st.header("Settings")
 
@@ -827,14 +759,14 @@ def run_app():
         use_gnews = st.checkbox("Include Google News", True)
 
         max_articles = st.slider(
-            "Max final articles",
+            "Max articles AFTER search",
             min_value=50,
-            max_value=400,
+            max_value=500,
             value=MAX_ARTICLES_DEFAULT,
             step=50,
         )
 
-    # ------------------------ MAIN QUERY --------------------- #
+    # MAIN QUERY
     st.markdown("### 🔍 Search Topic")
     c1, c2, c3 = st.columns([1, 3, 1])
     with c2:
@@ -853,21 +785,17 @@ def run_app():
         st.warning("Please enter a non-empty topic.")
         return
 
-    # ------------------------ PIPELINE ----------------------- #
-
-    # 1) LLM query expansion
+    # Query expansion via LLM
     with st.spinner("Using LLM to expand your topic into related concepts…"):
         expanded_queries = expand_query_with_llm(query)
 
     st.write("**Expanded search terms used (keyword layer):**")
     st.write(", ".join(expanded_queries))
 
-    # 2) Fetch extra data for this query from GDELT + Google News
+    # Fetch extra data for this query from GDELT + Google News
     if use_gdelt or use_gnews:
         with st.spinner("Fetching additional articles from GDELT / Google News…"):
             total_added = 0
-            # Use expansions for ingestion so US Tech / Nvidia / Technology
-            # have a richer overlapping pool.
             for q in expanded_queries:
                 if use_gdelt:
                     total_added += fetch_gdelt_articles(q, start_date, end_date)
@@ -875,11 +803,10 @@ def run_app():
                     total_added += fetch_gnews_articles(q, start_date, end_date)
         st.success(f"Added ~{total_added} extra articles for this topic.")
 
-    # 3) Hybrid search once, using original query for embeddings
-    with st.spinner("Running hybrid keyword + semantic search…"):
-        df = hybrid_search(
-            query=query,
-            keyword_terms=expanded_queries,
+    # Semantic-first hybrid search over ALL expanded queries
+    with st.spinner("Running semantic-first hybrid search…"):
+        df = semantic_search_multi(
+            queries=expanded_queries,
             start=start_date,
             end=end_date,
             top_k=max_articles,
@@ -893,9 +820,9 @@ def run_app():
         )
         return
 
-    st.write(f"🔎 Hybrid search found **{len(df)}** candidate articles.")
+    st.write(f"🔍 Hybrid search found **{len(df)}** candidate articles.")
 
-    # 4) Optional LLM article filter / selector
+    # Optional LLM article filter / selector
     with st.spinner("Letting LLM choose the most relevant subset of articles…"):
         df = llm_select_articles(query, df)
 
@@ -905,10 +832,8 @@ def run_app():
 
     st.success(f"✅ LLM selected **{len(df)}** final articles for analysis.")
 
-    # 5) SENTIMENT (cap to avoid huge batches)
-    df = df.head(MAX_ARTICLES_FOR_SENTIMENT).reset_index(drop=True)
-
-    with st.spinner("Running FinBERT sentiment classification (calibrated)…"):
+    # SENTIMENT
+    with st.spinner("Running FinBERT sentiment classification…"):
         texts = df["content"].fillna(df["summary"]).tolist()
         sents = finbert_sentiment(texts)
 
@@ -919,7 +844,7 @@ def run_app():
 
     sentiment_index = calculate_sentiment_index(df)
 
-    # ------------------------ TABS --------------------------- #
+    # TABS
     tab_dash, tab_articles, tab_keywords, tab_download = st.tabs(
         ["📊 Dashboard", "📰 Articles", "🔑 Keywords", "📥 Download"]
     )
@@ -936,20 +861,12 @@ def run_app():
 
         c_a, c_b, c_c, c_d, c_e = st.columns(5)
         c_a.metric("Total Articles", total)
-        c_b.metric(
-            "Positive", pos, f"{(pos / total * 100):.1f}%" if total else "0.0%"
-        )
-        c_c.metric(
-            "Negative", neg, f"{(neg / total * 100):.1f}%" if total else "0.0%"
-        )
-        c_d.metric(
-            "Neutral", neu, f"{(neu / total * 100):.1f}%" if total else "0.0%"
-        )
+        c_b.metric("Positive", pos, f"{(pos/total*100):.1f}%" if total else "0.0%")
+        c_c.metric("Negative", neg, f"{(neg/total*100):.1f}%" if total else "0.0%")
+        c_d.metric("Neutral", neu, f"{(neu/total*100):.1f}%" if total else "0.0%")
 
         direction = (
-            "Bullish" if sentiment_index > 5
-            else "Bearish" if sentiment_index < -5
-            else "Neutral"
+            "Bullish" if sentiment_index > 0 else "Bearish" if sentiment_index < 0 else "Neutral"
         )
         c_e.metric("Sentiment Index", f"{sentiment_index:.1f}", direction)
 
@@ -988,8 +905,8 @@ def run_app():
                         "axis": {"range": [-100, 100]},
                         "bar": {"color": gauge_color},
                         "steps": [
-                            {"range": [-100, 0], "color": "rgba(231, 76, 60, 0.15)"},
-                            {"range": [0, 100], "color": "rgba(46, 204, 113, 0.15)"},
+                            {"range": [-100, 0], "color": "rgba(231, 76, 60, 0.2)"},
+                            {"range": [0, 100], "color": "rgba(46, 204, 113, 0.2)"},
                         ],
                         "threshold": {
                             "line": {"color": "red", "width": 4},
@@ -1019,9 +936,7 @@ def run_app():
 
         with r2c2:
             st.markdown("#### Average Confidence by Sentiment")
-            avg_conf = (
-                df.groupby("sentiment_label")["sentiment_score"].mean() * 100
-            ).round(1)
+            avg_conf = (df.groupby("sentiment_label")["sentiment_score"].mean() * 100).round(1)
             fig_conf = px.bar(
                 x=avg_conf.index,
                 y=avg_conf.values,
@@ -1049,9 +964,7 @@ def run_app():
             ["relevance", "sentiment_score"], ascending=[False, False]
         )
         for _, row in filtered.iterrows():
-            icon = {"positive": "🟢", "negative": "🔴", "neutral": "🔵"}[
-                row["sentiment_label"]
-            ]
+            icon = {"positive": "🟢", "negative": "🔴", "neutral": "🔵"}[row["sentiment_label"]]
             st.markdown(f"**{icon} {row['title']}**")
             c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
             c1.caption(row["source_domain"])
@@ -1121,4 +1034,3 @@ def run_app():
 
 if __name__ == "__main__":
     run_app()
-
