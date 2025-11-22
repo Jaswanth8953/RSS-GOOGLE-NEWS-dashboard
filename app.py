@@ -20,7 +20,6 @@ from gnews import GNews
 from openai import OpenAI
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-
 # ========================== CONFIG ==========================
 
 DB_PATH = "news_articles.db"
@@ -43,7 +42,6 @@ MIN_SIMILARITY = 0.30          # a bit lower → more matches
 MAX_ARTICLES_DEFAULT = 200
 GDELT_MAX_RECORDS = 250
 GNEWS_MAX_RESULTS = 200
-
 
 # ========================== DB SETUP (LOCK-FREE) ==========================
 
@@ -81,9 +79,7 @@ def get_connection():
     conn.commit()
     return conn
 
-
 conn = get_connection()
-
 
 def safe_execute(query: str, params: tuple = ()):
     """
@@ -104,7 +100,6 @@ def safe_execute(query: str, params: tuple = ()):
             raise
     raise Exception("Database write failed after multiple retries")
 
-
 # ========================== OPENAI CLIENT ==========================
 
 @st.cache_resource
@@ -117,42 +112,80 @@ def get_openai_client():
     api_key = st.secrets["openai"]["api_key"]
     return OpenAI(api_key=api_key)
 
-
-# ========================== FINBERT SENTIMENT ==========================
+# ========================== FIXED FINBERT SENTIMENT ==========================
 
 @st.cache_resource
 def load_finbert():
-    tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-    return tokenizer, model, device
-
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
+        model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        model.eval()
+        return tokenizer, model, device
+    except Exception as e:
+        st.error(f"Failed to load FinBERT: {e}")
+        return None, None, None
 
 def finbert_sentiment(texts: List[str]) -> List[dict]:
     if not texts:
         return []
+    
     tokenizer, model, device = load_finbert()
-    enc = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=256,
-        return_tensors="pt",
-    ).to(device)
+    
+    # Fallback if model didn't load
+    if tokenizer is None or model is None:
+        return [{"label": "neutral", "score": 1.0}] * len(texts)
+    
+    # Better text preprocessing for financial news
+    processed_texts = []
+    for text in texts:
+        if not text or pd.isna(text):
+            processed_texts.append("")
+            continue
+        # Clean the text - remove extra spaces, truncate properly
+        clean_text = ' '.join(str(text).split())[:512]  # Limit length
+        processed_texts.append(clean_text)
+    
+    # Remove empty texts
+    valid_texts = [t for t in processed_texts if t.strip()]
+    if not valid_texts:
+        return [{"label": "neutral", "score": 1.0}] * len(texts)
+    
+    try:
+        enc = tokenizer(
+            valid_texts,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        ).to(device)
 
-    with torch.no_grad():
-        outputs = model(**enc)
-        probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
+        with torch.no_grad():
+            outputs = model(**enc)
+            probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
 
-    id2label = {0: "negative", 1: "neutral", 2: "positive"}
-    results = []
-    for p in probs:
-        idx = int(np.argmax(p))
-        results.append({"label": id2label[idx], "score": float(p[idx])})
-    return results
-
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
+        results = []
+        for p in probs:
+            idx = int(np.argmax(p))
+            results.append({"label": id2label[idx], "score": float(p[idx])})
+        
+        # Handle any texts that were filtered out
+        final_results = []
+        result_idx = 0
+        for i, text in enumerate(processed_texts):
+            if text.strip():  # Valid text
+                final_results.append(results[result_idx])
+                result_idx += 1
+            else:  # Empty text - default to neutral
+                final_results.append({"label": "neutral", "score": 1.0})
+                
+        return final_results
+        
+    except Exception as e:
+        # Fallback: return all neutral
+        return [{"label": "neutral", "score": 1.0}] * len(texts)
 
 # ========================== EMBEDDINGS ==========================
 
@@ -165,22 +198,20 @@ def get_embedding(text: str) -> List[float]:
     )
     return emb.data[0].embedding
 
-
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    denom = np.linalgorm(a) * np.linalg.norm(b)
     if denom == 0:
         return 0.0
     return float(np.dot(a, b) / denom)
 
-
-# ========================== RSS INGESTION ==========================
+# ========================== IMPROVED RSS INGESTION ==========================
 
 def parse_rss(url: str) -> List[dict]:
     feed = feedparser.parse(url)
     articles = []
     for entry in feed.entries:
-        title = entry.get("title", "")
-        summary = entry.get("summary", "")
+        title = entry.get("title", "").strip()
+        summary = entry.get("summary", "").strip()
         link = entry.get("link", "")
 
         if hasattr(entry, "published_parsed") and entry.published_parsed:
@@ -189,23 +220,29 @@ def parse_rss(url: str) -> List[dict]:
             pub = dt.datetime.utcnow()
         published = pub.isoformat()
 
-        if "content" in entry and entry.content:
-            content = entry.content[0].value
-        else:
+        # Better content extraction
+        content = ""
+        if summary and len(summary) > 50:  # Only use substantial summaries
             content = summary
+        elif "content" in entry and entry.content:
+            # Try to get the longest content available
+            contents = [c.value for c in entry.content if hasattr(c, 'value')]
+            if contents:
+                content = max(contents, key=len)
+        
+        # If still no good content, use title
+        if not content or len(content) < 20:
+            content = title
 
-        articles.append(
-            {
-                "title": title,
-                "summary": summary,
-                "published": published,
-                "link": link,
-                "source": url,
-                "content": content,
-            }
-        )
+        articles.append({
+            "title": title,
+            "summary": summary,
+            "published": published,
+            "link": link,
+            "source": url,
+            "content": content,
+        })
     return articles
-
 
 def fetch_rss_articles() -> int:
     new_count = 0
@@ -235,7 +272,6 @@ def fetch_rss_articles() -> int:
             except Exception:
                 pass
     return new_count
-
 
 # ========================== GDELT INGESTION ==========================
 
@@ -291,7 +327,6 @@ def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
 
     return new_count
 
-
 # ========================== GOOGLE NEWS (GNews) ==========================
 
 def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
@@ -334,7 +369,6 @@ def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
 
     return new_count
 
-
 # ========================== EMBEDDING MANAGEMENT ==========================
 
 def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
@@ -365,7 +399,6 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     )
     return df
 
-
 def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
     """
     Add embeddings for rows that don't have them yet.
@@ -381,70 +414,6 @@ def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
                 "UPDATE articles SET embedding = ? WHERE id = ?",
                 (json.dumps(emb), int(row["id"])),
             )
-
-
-# ---------- OLD single-query hybrid search (kept for reference, not used) --
-
-def hybrid_search(
-    query: str,
-    start: dt.date,
-    end: dt.date,
-    top_k: int,
-    min_sim: float = MIN_SIMILARITY,
-) -> pd.DataFrame:
-    """
-    Single-query hybrid search (kept for reference). Not used in the main app.
-    """
-    df = load_articles_for_range(start, end)
-    if df.empty:
-        return df
-
-    df["embedding"] = df["embedding"].apply(
-        lambda x: None if x in (None, "", "NULL") else x
-    )
-
-    ensure_embeddings(df[["id", "title", "summary", "embedding"]])
-
-    df = load_articles_for_range(start, end)
-    if df.empty:
-        return df
-
-    q_emb = np.array(get_embedding(query))
-    sims = []
-    for _, row in df.iterrows():
-        emb_vec = np.array(json.loads(row["embedding"]))
-        sims.append(cosine_similarity(q_emb, emb_vec))
-    df["similarity"] = sims
-
-    q_lower = query.lower().strip()
-    kw_mask = (
-        df["title"].str.lower().str.contains(q_lower, na=False)
-        | df["summary"].str.lower().str.contains(q_lower, na=False)
-        | df["content"].str.lower().str.contains(q_lower, na=False)
-    )
-
-    sem_mask = df["similarity"] >= min_sim
-
-    if kw_mask.any() and sem_mask.any():
-        mask = kw_mask & sem_mask
-        df["match_type"] = np.where(
-            mask,
-            "keyword+semantic",
-            np.where(kw_mask, "keyword", "semantic"),
-        )
-        filtered = df[kw_mask | sem_mask]
-    elif kw_mask.any():
-        df["match_type"] = "keyword"
-        filtered = df[kw_mask]
-    elif sem_mask.any():
-        df["match_type"] = "semantic"
-        filtered = df[sem_mask]
-    else:
-        return pd.DataFrame()
-
-    filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
-    return filtered
-
 
 # ---------- NEW semantic-first multi-query hybrid search (OPTION A) ------
 
@@ -555,7 +524,6 @@ def semantic_search_multi(
     filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
     return filtered
 
-
 # ========================== LLM QUERY EXPANSION ==========================
 
 def expand_query_with_llm(query: str) -> List[str]:
@@ -595,7 +563,6 @@ Return ONLY a valid JSON list of strings, like:
         return [query] + expansions
     except Exception:
         return [query]
-
 
 # ========================== LLM ARTICLE SELECTION ==========================
 
@@ -653,7 +620,6 @@ Articles:
         # if anything goes wrong, just return original df
         return df
 
-
 # ========================== KEYWORDS & SENTIMENT INDEX ==========================
 
 def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]]:
@@ -692,7 +658,6 @@ def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]
     counter = Counter(words)
     return counter.most_common(n)
 
-
 def calculate_sentiment_index(df: pd.DataFrame) -> float:
     pos = len(df[df["sentiment_label"] == "positive"])
     neg = len(df[df["sentiment_label"] == "negative"])
@@ -701,7 +666,6 @@ def calculate_sentiment_index(df: pd.DataFrame) -> float:
         return 0.0
     index = ((pos - neg) / total) * 100
     return round(index, 2)
-
 
 # ========================== STREAMLIT APP ==========================
 
@@ -843,6 +807,17 @@ def run_app():
     df["source_domain"] = df["source"].fillna("").replace("", "unknown")
 
     sentiment_index = calculate_sentiment_index(df)
+
+    # DEBUG: Show sentiment distribution
+    st.subheader("DEBUG: Sentiment Analysis Details")
+    st.write(f"Total articles analyzed: {len(df)}")
+    st.write("Sentiment counts:")
+    st.write(df['sentiment_label'].value_counts())
+    
+    # Show some examples
+    st.write("Sample articles with sentiments:")
+    sample_df = df[['title', 'sentiment_label', 'sentiment_score']].head(10)
+    st.dataframe(sample_df)
 
     # TABS
     tab_dash, tab_articles, tab_keywords, tab_download = st.tabs(
@@ -1030,7 +1005,6 @@ def run_app():
         )
         st.write("### Data Preview")
         st.dataframe(dl_df, use_container_width=True)
-
 
 if __name__ == "__main__":
     run_app()
