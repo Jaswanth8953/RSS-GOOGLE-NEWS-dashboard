@@ -1,11 +1,10 @@
 streamlit
+openai>=1.40.0
+requests
+feedparser
 pandas
 numpy
-feedparser
 torch
 transformers
-openai
-requests
-beautifulsoup4
 gnews
 plotly
