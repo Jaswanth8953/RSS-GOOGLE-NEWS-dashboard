@@ -73,15 +73,11 @@ conn = get_connection()
 @st.cache_resource
 def get_openai_client():
     """
-    Reads OPENAI_API_KEY from environment (set via Streamlit Secrets).
+    Reads OPENAI_API_KEY from Streamlit Secrets.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY not found. "
-            "Set it in Streamlit → Settings → Secrets."
-        )
+    api_key = st.secrets["openai"]["api_key"]  # <--- FIXED
     return OpenAI(api_key=api_key)
+
 
 
 # ========================== FINBERT SENTIMENT ==========================
