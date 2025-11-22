@@ -74,7 +74,11 @@ conn = get_connection()
 
 @st.cache_resource
 def get_openai_client():
-    return OpenAI()
+    """
+    Reads OPENAI_API_KEY from Streamlit Secrets.
+    """
+    api_key = st.secrets["openai"]["api_key"]
+    return OpenAI(api_key=api_key)
 
 
 
