@@ -38,8 +38,9 @@ RSS_FEEDS = [
 OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
-MIN_SIMILARITY = 0.30          # a bit lower to get more matches
-MAX_ARTICLES_DEFAULT = 200
+# Slightly lowered similarity to catch more semantically related articles
+MIN_SIMILARITY = 0.22
+MAX_ARTICLES_DEFAULT = 300
 GDELT_MAX_RECORDS = 250
 GNEWS_MAX_RESULTS = 200
 
@@ -47,7 +48,9 @@ GNEWS_MAX_RESULTS = 200
 # ========================== DB SETUP ==========================
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # timeout + WAL to reduce "database is locked" errors on Streamlit Cloud
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS articles (
@@ -69,12 +72,19 @@ conn = get_connection()
 
 
 # ========================== OPENAI CLIENT ==========================
+
 @st.cache_resource
 def get_openai_client():
+    """
+    OpenAI client using Streamlit secrets.
+
+    In Streamlit Cloud, you must set in Advanced Settings → Secrets:
+
+    [openai]
+    api_key = "sk-...."
+    """
     api_key = st.secrets["openai"]["api_key"]
     return OpenAI(api_key=api_key)
-
-
 
 
 # ========================== FINBERT SENTIMENT ==========================
@@ -391,6 +401,7 @@ def hybrid_search(
 
     sem_mask = df["similarity"] >= min_sim
 
+    # Combined match_type + score
     if kw_mask.any() and sem_mask.any():
         mask = kw_mask & sem_mask
         df["match_type"] = np.where(
@@ -399,74 +410,124 @@ def hybrid_search(
             np.where(kw_mask, "keyword", "semantic"),
         )
         filtered = df[kw_mask | sem_mask]
+        keyword_boost = 0.08
+        df["score"] = df["similarity"] + keyword_boost * kw_mask.astype(float)
     elif kw_mask.any():
         df["match_type"] = "keyword"
         filtered = df[kw_mask]
+        df["score"] = df["similarity"]
     elif sem_mask.any():
         df["match_type"] = "semantic"
         filtered = df[sem_mask]
+        df["score"] = df["similarity"]
     else:
         return pd.DataFrame()
 
-    filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
-    return filtered
+    if "score" in filtered.columns:
+        filtered = filtered.sort_values("score", ascending=False)
+    else:
+        filtered = filtered.sort_values("similarity", ascending=False)
+
+    return filtered.head(top_k)
 
 
 # ========================== LLM QUERY EXPANSION ==========================
 
 def expand_query_with_llm(query: str) -> List[str]:
     """
-    Use LLM to generate related terms for the user's query.
-    This is what helps fix US Tech vs Nvidia vs Technology differences.
+    Use an LLM to generate a *canonical* topic + related search terms.
+
+    Goal (per Eric's email):
+    - Similar concepts like "US Tech", "technology", "technology companies"
+      should map to a shared canonical topic and related expansions.
     """
     client = get_openai_client()
 
     prompt = f"""
-You are helping expand a financial news search query.
+You help normalize and expand financial news search topics.
 
-Original query: "{query}"
+User topic: "{query}"
 
-Generate 8-12 alternative search terms that:
-- mean the same
-- are closely related industries
-- include broader and narrower concepts
-- include common synonyms
+1. First, decide on ONE **canonical topic** that captures the general idea.
+   - Example: "US Tech" -> "technology"
+   - Example: "European textiles" -> "textile industry"
+   - Example: "German auto companies" -> "automotive industry"
 
-Return ONLY a valid JSON list of strings, like:
-["term1", "term2", "term3"]
+2. Then propose 8–12 alternate phrasings and related terms, including:
+   - broader terms, narrower terms, sector names, company-level terms
+   - both regional and global forms if the query has a country/region
+
+Return ONLY valid JSON with this structure:
+
+{{
+  "canonical": "general topic here",
+  "expansions": ["term1", "term2", "term3", ...]
+}}
 """
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You generate semantic search expansions."},
+                {
+                    "role": "system",
+                    "content": (
+                        "You normalize financial news topics so that similar ideas "
+                        "map to the same canonical topic and related search terms."
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ],
         )
         content = resp.choices[0].message.content.strip()
-        expansions = json.loads(content)
-        expansions = [str(t) for t in expansions if isinstance(t, str)]
-        # always include original query as first term
-        return [query] + expansions
+
+        data = json.loads(content)
+        canonical = str(data.get("canonical", "")).strip()
+        expansions = data.get("expansions", [])
+
+        terms: List[str] = []
+
+        # Always include the user's original query
+        terms.append(query)
+
+        # Include canonical topic if non-empty
+        if canonical:
+            terms.append(canonical)
+
+        # Include all expansions as strings
+        for t in expansions:
+            if isinstance(t, str) and t.strip():
+                terms.append(t.strip())
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_terms = []
+        for t in terms:
+            key = t.lower()
+            if key not in seen:
+                seen.add(key)
+                unique_terms.append(t)
+
+        return unique_terms
+
     except Exception:
+        # If anything goes wrong, at least return the original query
         return [query]
 
 
-# ========================== LLM ARTICLE SELECTION (optional extra filter) ==========================
+# ========================== LLM ARTICLE SELECTION ==========================
 
 def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
     """
     Let the LLM decide which of the already-matched articles
     are truly relevant to the user's topic.
-    We send only (id, title, summary) to the LLM to keep it light.
+    We send only (id, title, summary) to keep it light.
     """
     if df.empty:
         return df
 
     client = get_openai_client()
 
-    # Prepare lightweight list
     items = [
         {
             "id": int(row["id"]),
@@ -495,7 +556,10 @@ Articles:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You select relevant financial news articles."},
+                {
+                    "role": "system",
+                    "content": "You select relevant financial news articles.",
+                },
                 {"role": "user", "content": prompt},
             ],
         )
@@ -506,7 +570,7 @@ Articles:
         selected_ids = set(int(i) for i in selected_ids)
         return df[df["id"].isin(selected_ids)]
     except Exception:
-        # if anything goes wrong, just return original df
+        # If anything goes wrong, just return original df
         return df
 
 
@@ -568,13 +632,14 @@ def run_app():
         initial_sidebar_state="expanded",
     )
 
-    # Title
     st.title("📈 Financial News Sentiment Dashboard")
     st.markdown(
-        "RSS + Google News + GDELT → **Hybrid + LLM Query Expansion + LLM Article Selection** → FinBERT Sentiment"
+        "RSS + Google News + GDELT → "
+        "**Hybrid + LLM Query Expansion + LLM Article Selection** → FinBERT Sentiment"
     )
+    st.caption("Built by Jaswanth Krishna Kondisetty & Archana Varala")
 
-    # Sidebar toggle (optional)
+    # Sidebar toggle
     if "show_sidebar" not in st.session_state:
         st.session_state["show_sidebar"] = True
 
@@ -681,7 +746,6 @@ def run_app():
             return
 
         df = pd.concat(dfs, ignore_index=True)
-        # drop duplicates by link
         df = df.drop_duplicates(subset=["link"])
 
     st.write(f"🔎 Initial hybrid search found **{len(df)}** candidate articles.")
@@ -898,12 +962,3 @@ def run_app():
 
 if __name__ == "__main__":
     run_app()
-
-    
-    
-    
- 
-      
-   
-    
-       
