@@ -74,11 +74,7 @@ conn = get_connection()
 
 @st.cache_resource
 def get_openai_client():
-    """
-    Reads OPENAI_API_KEY from Streamlit Secrets (TOML format).
-    """
-    api_key = st.secrets["openai"]["api_key"]   # <-- CORRECT FOR STREAMLIT CLOUD
-    return OpenAI(api_key=api_key)
+    return OpenAI()
 
 
 
