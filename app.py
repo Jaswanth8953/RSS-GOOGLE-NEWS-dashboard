@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+import time
 import datetime as dt
 from typing import List, Tuple
 
@@ -38,19 +39,31 @@ RSS_FEEDS = [
 OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
-# Slightly lowered similarity to catch more semantically related articles
-MIN_SIMILARITY = 0.22
-MAX_ARTICLES_DEFAULT = 300
+MIN_SIMILARITY = 0.30          # a bit lower → more matches
+MAX_ARTICLES_DEFAULT = 200
 GDELT_MAX_RECORDS = 250
 GNEWS_MAX_RESULTS = 200
 
 
-# ========================== DB SETUP ==========================
+# ========================== DB SETUP (LOCK-FREE) ==========================
 
 def get_connection():
-    # timeout + WAL to reduce "database is locked" errors on Streamlit Cloud
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=60)
+    """
+    Single shared SQLite connection.
+    WAL mode + timeout to avoid 'database is locked'.
+    """
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        timeout=30  # wait up to 30s if locked
+    )
+
+    # WAL mode allows concurrent reads/writes
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA cache_size = -20000;")  # use memory cache
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS articles (
@@ -65,10 +78,31 @@ def get_connection():
         );
         """
     )
+    conn.commit()
     return conn
 
 
 conn = get_connection()
+
+
+def safe_execute(query: str, params: tuple = ()):
+    """
+    Safer wrapper for INSERT/UPDATE with retry if DB is locked.
+    """
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            cur = conn.cursor()
+            cur.execute(query, params)
+            conn.commit()
+            return cur
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                time.sleep(0.5)
+                continue
+            raise
+    raise Exception("Database write failed after multiple retries")
 
 
 # ========================== OPENAI CLIENT ==========================
@@ -76,10 +110,7 @@ conn = get_connection()
 @st.cache_resource
 def get_openai_client():
     """
-    OpenAI client using Streamlit secrets.
-
-    In Streamlit Cloud, you must set in Advanced Settings → Secrets:
-
+    Uses Streamlit secrets:
     [openai]
     api_key = "sk-...."
     """
@@ -177,7 +208,6 @@ def parse_rss(url: str) -> List[dict]:
 
 
 def fetch_rss_articles() -> int:
-    cur = conn.cursor()
     new_count = 0
     for url in RSS_FEEDS:
         try:
@@ -186,7 +216,7 @@ def fetch_rss_articles() -> int:
             continue
         for art in arts:
             try:
-                cur.execute(
+                safe_execute(
                     """
                     INSERT OR IGNORE INTO articles
                     (title, summary, published, link, source, content, embedding)
@@ -201,11 +231,9 @@ def fetch_rss_articles() -> int:
                         art["content"],
                     ),
                 )
-                if cur.rowcount > 0:
-                    new_count += 1
+                new_count += 1
             except Exception:
                 pass
-    conn.commit()
     return new_count
 
 
@@ -215,7 +243,6 @@ def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
     """
     Pulls articles from GDELT 2.0 DOC API for a given query and date range.
     """
-    cur = conn.cursor()
     new_count = 0
 
     start_str = start.strftime("%Y%m%d000000")
@@ -250,7 +277,7 @@ def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
         content = a.get("snippet", "") or summary
 
         try:
-            cur.execute(
+            safe_execute(
                 """
                 INSERT OR IGNORE INTO articles
                 (title, summary, published, link, source, content, embedding)
@@ -258,19 +285,16 @@ def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
                 """,
                 (title, summary, published, link, src, content),
             )
-            if cur.rowcount > 0:
-                new_count += 1
+            new_count += 1
         except Exception:
             pass
 
-    conn.commit()
     return new_count
 
 
 # ========================== GOOGLE NEWS (GNews) ==========================
 
 def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
-    cur = conn.cursor()
     new_count = 0
 
     try:
@@ -296,7 +320,7 @@ def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
         content = desc
 
         try:
-            cur.execute(
+            safe_execute(
                 """
                 INSERT OR IGNORE INTO articles
                 (title, summary, published, link, source, content, embedding)
@@ -304,12 +328,10 @@ def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
                 """,
                 (title, desc, published, link, source, content),
             )
-            if cur.rowcount > 0:
-                new_count += 1
+            new_count += 1
         except Exception:
             pass
 
-    conn.commit()
     return new_count
 
 
@@ -345,18 +367,20 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
 
 
 def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
-    cur = conn.cursor()
+    """
+    Add embeddings for rows that don't have them yet.
+    Uses safe_execute to avoid DB locking.
+    """
     for _, row in df_ids_title_summary.iterrows():
         if row["embedding"] is None:
             text = (row["title"] or "") + " " + (row["summary"] or "")
             if not text.strip():
                 continue
             emb = get_embedding(text)
-            cur.execute(
+            safe_execute(
                 "UPDATE articles SET embedding = ? WHERE id = ?",
                 (json.dumps(emb), int(row["id"])),
             )
-    conn.commit()
 
 
 def hybrid_search(
@@ -401,7 +425,6 @@ def hybrid_search(
 
     sem_mask = df["similarity"] >= min_sim
 
-    # Combined match_type + score
     if kw_mask.any() and sem_mask.any():
         mask = kw_mask & sem_mask
         df["match_type"] = np.where(
@@ -410,108 +433,57 @@ def hybrid_search(
             np.where(kw_mask, "keyword", "semantic"),
         )
         filtered = df[kw_mask | sem_mask]
-        keyword_boost = 0.08
-        df["score"] = df["similarity"] + keyword_boost * kw_mask.astype(float)
     elif kw_mask.any():
         df["match_type"] = "keyword"
         filtered = df[kw_mask]
-        df["score"] = df["similarity"]
     elif sem_mask.any():
         df["match_type"] = "semantic"
         filtered = df[sem_mask]
-        df["score"] = df["similarity"]
     else:
         return pd.DataFrame()
 
-    if "score" in filtered.columns:
-        filtered = filtered.sort_values("score", ascending=False)
-    else:
-        filtered = filtered.sort_values("similarity", ascending=False)
-
-    return filtered.head(top_k)
+    filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
+    return filtered
 
 
 # ========================== LLM QUERY EXPANSION ==========================
 
 def expand_query_with_llm(query: str) -> List[str]:
     """
-    Use an LLM to generate a *canonical* topic + related search terms.
-
-    Goal (per Eric's email):
-    - Similar concepts like "US Tech", "technology", "technology companies"
-      should map to a shared canonical topic and related expansions.
+    Use LLM to generate related terms for the user's query.
+    This is what helps fix US Tech vs Nvidia vs Technology differences.
     """
     client = get_openai_client()
 
     prompt = f"""
-You help normalize and expand financial news search topics.
+You are helping expand a financial news search query.
 
-User topic: "{query}"
+Original query: "{query}"
 
-1. First, decide on ONE **canonical topic** that captures the general idea.
-   - Example: "US Tech" -> "technology"
-   - Example: "European textiles" -> "textile industry"
-   - Example: "German auto companies" -> "automotive industry"
+Generate 8-12 alternative search terms that:
+- mean the same
+- are closely related industries
+- include broader and narrower concepts
+- include common synonyms
 
-2. Then propose 8–12 alternate phrasings and related terms, including:
-   - broader terms, narrower terms, sector names, company-level terms
-   - both regional and global forms if the query has a country/region
-
-Return ONLY valid JSON with this structure:
-
-{{
-  "canonical": "general topic here",
-  "expansions": ["term1", "term2", "term3", ...]
-}}
+Return ONLY a valid JSON list of strings, like:
+["term1", "term2", "term3"]
 """
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You normalize financial news topics so that similar ideas "
-                        "map to the same canonical topic and related search terms."
-                    ),
-                },
+                {"role": "system", "content": "You generate semantic search expansions."},
                 {"role": "user", "content": prompt},
             ],
         )
         content = resp.choices[0].message.content.strip()
-
-        data = json.loads(content)
-        canonical = str(data.get("canonical", "")).strip()
-        expansions = data.get("expansions", [])
-
-        terms: List[str] = []
-
-        # Always include the user's original query
-        terms.append(query)
-
-        # Include canonical topic if non-empty
-        if canonical:
-            terms.append(canonical)
-
-        # Include all expansions as strings
-        for t in expansions:
-            if isinstance(t, str) and t.strip():
-                terms.append(t.strip())
-
-        # Deduplicate while preserving order
-        seen = set()
-        unique_terms = []
-        for t in terms:
-            key = t.lower()
-            if key not in seen:
-                seen.add(key)
-                unique_terms.append(t)
-
-        return unique_terms
-
+        expansions = json.loads(content)
+        expansions = [str(t) for t in expansions if isinstance(t, str)]
+        # always include original query as first term
+        return [query] + expansions
     except Exception:
-        # If anything goes wrong, at least return the original query
         return [query]
 
 
@@ -521,13 +493,14 @@ def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
     """
     Let the LLM decide which of the already-matched articles
     are truly relevant to the user's topic.
-    We send only (id, title, summary) to keep it light.
+    We send only (id, title, summary) to the LLM to keep it light.
     """
     if df.empty:
         return df
 
     client = get_openai_client()
 
+    # Prepare lightweight list
     items = [
         {
             "id": int(row["id"]),
@@ -556,10 +529,7 @@ Articles:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You select relevant financial news articles.",
-                },
+                {"role": "system", "content": "You select relevant financial news articles."},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -570,7 +540,7 @@ Articles:
         selected_ids = set(int(i) for i in selected_ids)
         return df[df["id"].isin(selected_ids)]
     except Exception:
-        # If anything goes wrong, just return original df
+        # if anything goes wrong, just return original df
         return df
 
 
@@ -632,14 +602,13 @@ def run_app():
         initial_sidebar_state="expanded",
     )
 
+    # Title
     st.title("📈 Financial News Sentiment Dashboard")
     st.markdown(
-        "RSS + Google News + GDELT → "
-        "**Hybrid + LLM Query Expansion + LLM Article Selection** → FinBERT Sentiment"
+        "RSS + Google News + GDELT → **Hybrid + LLM Query Expansion + LLM Article Selection** → FinBERT Sentiment"
     )
-    st.caption("Built by Jaswanth Krishna Kondisetty & Archana Varala")
 
-    # Sidebar toggle
+    # Sidebar toggle (optional)
     if "show_sidebar" not in st.session_state:
         st.session_state["show_sidebar"] = True
 
@@ -746,6 +715,7 @@ def run_app():
             return
 
         df = pd.concat(dfs, ignore_index=True)
+        # drop duplicates by link
         df = df.drop_duplicates(subset=["link"])
 
     st.write(f"🔎 Initial hybrid search found **{len(df)}** candidate articles.")
@@ -962,3 +932,20 @@ def run_app():
 
 if __name__ == "__main__":
     run_app()
+
+
+
+       
+    
+    
+        
+    
+    
+
+
+  
+           
+   
+               
+       
+
