@@ -30,8 +30,8 @@ RSS_FEEDS = [
     "https://www.aljazeera.com/xml/rss/all.xml",
     "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
     "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/technologyNews",  # Added tech-specific
-    "https://feeds.reuters.com/reuters/companiesNews",   # Added companies
+    "https://feeds.reuters.com/reuters/technologyNews",
+    "https://feeds.reuters.com/reuters/companiesNews",
     "https://rss.bloomberg.com/markets/news.rss",
     "https://www.wsj.com/news/markets?mod=rss_markets_main",
 ]
@@ -40,46 +40,149 @@ OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
 # Tuned parameters
-MIN_SIMILARITY = 0.25  # Lower threshold for broader matching
-MAX_ARTICLES_DEFAULT = 200
-GDELT_MAX_RECORDS = 100
-GNEWS_MAX_RESULTS = 100
+MIN_SIMILARITY = 0.18  # Lower threshold for broader matching
+MAX_ARTICLES_DEFAULT = 500
+GDELT_MAX_RECORDS = 150
+GNEWS_MAX_RESULTS = 150
+
+# ========================== PREMIUM STYLING ==========================
+
+def apply_premium_styling():
+    """Apply luxury styling to the dashboard"""
+    st.markdown("""
+    <style>
+    /* Main background gradient */
+    .main {
+        background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 50%, #16213e 100%);
+    }
+    
+    /* Premium headers */
+    h1, h2, h3 {
+        background: linear-gradient(90deg, #FFD700, #FFA500, #FF6B6B);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 800 !important;
+    }
+    
+    /* Card styling */
+    .metric-card {
+        background: rgba(255, 255, 255, 0.05);
+        backdrop-filter: blur(10px);
+        border-radius: 15px;
+        padding: 20px;
+        border: 1px solid rgba(255, 215, 0, 0.2);
+        box-shadow: 0 8px 32px rgba(255, 215, 0, 0.1);
+        margin: 10px 0;
+    }
+    
+    /* Button styling */
+    .stButton>button {
+        background: linear-gradient(135deg, #FFD700 0%, #FFA500 100%);
+        color: #000000 !important;
+        border: none;
+        border-radius: 25px;
+        padding: 12px 24px;
+        font-weight: 600;
+        box-shadow: 0 4px 15px rgba(255, 215, 0, 0.3);
+        transition: all 0.3s ease;
+    }
+    
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(255, 215, 0, 0.4);
+    }
+    
+    /* Input field styling */
+    .stTextInput>div>div>input {
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 215, 0, 0.3);
+        border-radius: 15px;
+        color: white;
+        padding: 12px 20px;
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
+    }
+    
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 10px 10px 0 0;
+        padding: 12px 24px;
+        border: 1px solid rgba(255, 215, 0, 0.2);
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #FFD700 0%, #FFA500 100%) !important;
+        color: #000000 !important;
+    }
+    
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+        width: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: linear-gradient(180deg, #FFD700, #FFA500);
+        border-radius: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 # ========================== DATABASE SETUP ==========================
 
-def init_database():
-    """Initialize database with proper settings"""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+def get_connection():
+    """
+    Single shared SQLite connection.
+    WAL mode + timeout to avoid 'database is locked'.
+    """
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        timeout=30  # wait up to 30s if locked
+    )
+
+    # WAL mode allows concurrent reads/writes
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA cache_size = -10000;")
-    
-    conn.execute("""
+    conn.execute("PRAGMA cache_size = -20000;")  # use memory cache
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS articles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
+            title TEXT,
             summary TEXT,
             published TEXT,
             link TEXT UNIQUE,
             source TEXT,
             content TEXT,
-            embedding TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Create index for better performance
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_published ON articles(published)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_embedding ON articles(embedding IS NOT NULL)")
+            embedding TEXT
+        );
+        """
+    )
     conn.commit()
     return conn
 
-conn = init_database()
+conn = get_connection()
 
-def safe_db_execute(query: str, params: tuple = ()):
-    """Safe database execution with retry logic"""
-    max_retries = 5
+def safe_execute(query: str, params: tuple = ()):
+    """
+    Safer wrapper for INSERT/UPDATE with retry if DB is locked.
+    """
+    max_retries = 10
     for attempt in range(max_retries):
         try:
             cur = conn.cursor()
@@ -87,11 +190,12 @@ def safe_db_execute(query: str, params: tuple = ()):
             conn.commit()
             return cur
         except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower():
-                time.sleep(0.2)
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                time.sleep(0.5)
                 continue
             raise
-    raise Exception("Database operation failed after retries")
+    raise Exception("Database write failed after multiple retries")
 
 # ========================== OPENAI SETUP ==========================
 
@@ -101,286 +205,10 @@ def get_openai_client():
     api_key = st.secrets["openai"]["api_key"]
     return OpenAI(api_key=api_key)
 
-# ========================== IMPROVED QUERY EXPANSION ==========================
-
-def expand_query_advanced(query: str) -> List[str]:
-    """
-    Advanced query expansion with multiple strategies to ensure balanced results
-    """
-    client = get_openai_client()
-    
-    # Pre-defined expansions for common queries to ensure consistency
-    predefined_expansions = {
-        "us tech": [
-            "US technology sector", "American tech companies", "Silicon Valley", 
-            "tech stocks", "NASDAQ composite", "US software industry", 
-            "US hardware manufacturers", "American innovation", "digital technology USA",
-            "US tech giants", "technology sector United States", "US computer industry"
-        ],
-        "nvidia": [
-            "NVDA stock", "GPU manufacturer", "AI chips", "semiconductor company",
-            "graphics processing units", "Jensen Huang", "CUDA technology",
-            "GeForce RTX", "data center chips", "gaming GPUs", "artificial intelligence hardware",
-            "chip stocks", "semiconductor stocks"
-        ],
-        "technology": [
-            "tech industry", "information technology", "digital technology",
-            "computer technology", "tech sector", "innovation", "digital transformation",
-            "emerging technologies", "tech companies", "software development",
-            "hardware manufacturing", "IT sector"
-        ],
-        "technology companies": [
-            "tech firms", "software companies", "hardware manufacturers",
-            "IT corporations", "technology stocks", "digital companies",
-            "tech enterprises", "computer companies", "internet companies"
-        ]
-    }
-    
-    query_lower = query.lower().strip()
-    
-    # Use predefined expansions if available
-    if query_lower in predefined_expansions:
-        base_terms = predefined_expansions[query_lower]
-    else:
-        # Generate expansions for other queries
-        try:
-            prompt = f"""
-            Expand this financial/news search query: "{query}"
-            
-            Generate 10-15 alternative terms that capture:
-            - Exact synonyms and related terms
-            - Broader industry categories
-            - Specific companies/products in that space
-            - Financial/market terminology
-            - Common abbreviations and variations
-            
-            Return ONLY a JSON array of strings.
-            """
-            
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a financial news search expert. Generate comprehensive search term expansions."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7
-            )
-            
-            content = response.choices[0].message.content.strip()
-            base_terms = json.loads(content)
-        except:
-            # Fallback basic expansion
-            base_terms = [query]
-    
-    # Always include the original query and ensure diversity
-    all_terms = [query] + base_terms
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_terms = []
-    for term in all_terms:
-        term_lower = term.lower()
-        if term_lower not in seen and len(term.strip()) > 0:
-            unique_terms.append(term)
-            seen.add(term_lower)
-    
-    return unique_terms[:15]  # Limit to 15 terms
-
-# ========================== ENHANCED SEMANTIC SEARCH ==========================
-
-def get_embedding(text: str) -> List[float]:
-    """Get embedding for text"""
-    client = get_openai_client()
-    text = text.replace("\n", " ").strip()
-    if not text:
-        return [0.0] * 1536  # Default embedding dimension
-    
-    response = client.embeddings.create(
-        model=OPENAI_EMBED_MODEL,
-        input=text
-    )
-    return response.data[0].embedding
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Calculate cosine similarity"""
-    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return np.dot(a, b) / (norm_a * norm_b)
-
-def hybrid_semantic_search(
-    queries: List[str], 
-    start_date: dt.date, 
-    end_date: dt.date, 
-    top_k: int = 200
-) -> pd.DataFrame:
-    """
-    Enhanced hybrid search with better query processing
-    """
-    # Load articles from date range
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, title, summary, published, link, source, content, embedding FROM articles WHERE date(published) BETWEEN ? AND ?",
-        (start_date.isoformat(), end_date.isoformat())
-    )
-    
-    rows = cur.fetchall()
-    if not rows:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(rows, columns=[
-        "id", "title", "summary", "published", "link", "source", "content", "embedding"
-    ])
-    
-    # Ensure embeddings exist
-    missing_embeddings = df[df["embedding"].isna() | (df["embedding"] == "") | (df["embedding"] == "NULL")]
-    for _, row in missing_embeddings.iterrows():
-        text = f"{row['title']} {row['summary']}".strip()
-        if text:
-            embedding = get_embedding(text)
-            safe_db_execute(
-                "UPDATE articles SET embedding = ? WHERE id = ?",
-                (json.dumps(embedding), row["id"])
-            )
-    
-    # Reload with embeddings
-    cur.execute(
-        "SELECT id, title, summary, published, link, source, content, embedding FROM articles WHERE date(published) BETWEEN ? AND ? AND embedding IS NOT NULL",
-        (start_date.isoformat(), end_date.isoformat())
-    )
-    rows = cur.fetchall()
-    if not rows:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(rows, columns=[
-        "id", "title", "summary", "published", "link", "source", "content", "embedding"
-    ])
-    
-    # Get query embeddings for all expanded terms
-    query_embeddings = []
-    for query in queries:
-        if query.strip():
-            query_embeddings.append(get_embedding(query))
-    
-    if not query_embeddings:
-        return pd.DataFrame()
-    
-    # Average all query embeddings
-    avg_query_embedding = np.mean(query_embeddings, axis=0)
-    
-    # Calculate similarities
-    similarities = []
-    for _, row in df.iterrows():
-        try:
-            article_embedding = np.array(json.loads(row["embedding"]))
-            similarity = cosine_similarity(avg_query_embedding, article_embedding)
-            similarities.append(similarity)
-        except:
-            similarities.append(0.0)
-    
-    df["similarity"] = similarities
-    
-    # Keyword matching boost
-    query_terms = [q.lower() for q in queries if q.strip()]
-    
-    def keyword_match_score(text):
-        if not text or not query_terms:
-            return 0
-        text_lower = str(text).lower()
-        matches = sum(1 for term in query_terms if term in text_lower)
-        return matches * 0.1  # Small boost for keyword matches
-    
-    df["keyword_boost"] = df["title"].fillna("").apply(keyword_match_score) + \
-                         df["summary"].fillna("").apply(keyword_match_score) + \
-                         df["content"].fillna("").apply(keyword_match_score)
-    
-    df["combined_score"] = df["similarity"] + df["keyword_boost"]
-    
-    # Filter and return top results
-    filtered = df[df["combined_score"] >= MIN_SIMILARITY]
-    if filtered.empty:
-        # Fallback: return top by similarity regardless of threshold
-        filtered = df.nlargest(top_k, "combined_score")
-    else:
-        filtered = filtered.nlargest(top_k, "combined_score")
-    
-    return filtered
-
-# ========================== DATA INGESTION ==========================
-
-def fetch_rss_articles() -> int:
-    """Fetch articles from RSS feeds"""
-    new_count = 0
-    for url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:20]:  # Limit per feed
-                title = entry.get("title", "").strip()
-                summary = entry.get("summary", "").strip()
-                link = entry.get("link", "")
-                
-                # Parse publication date
-                if hasattr(entry, "published_parsed") and entry.published_parsed:
-                    pub_date = dt.datetime(*entry.published_parsed[:6])
-                else:
-                    pub_date = dt.datetime.utcnow()
-                
-                content = summary
-                if "content" in entry and entry.content:
-                    content = entry.content[0].get("value", summary)
-                
-                # Insert article
-                try:
-                    safe_db_execute(
-                        "INSERT OR IGNORE INTO articles (title, summary, published, link, source, content) VALUES (?, ?, ?, ?, ?, ?)",
-                        (title, summary, pub_date.isoformat(), link, url, content)
-                    )
-                    new_count += 1
-                except:
-                    continue
-                    
-        except Exception as e:
-            continue
-    
-    return new_count
-
-def fetch_external_articles(query: str, start_date: dt.date, end_date: dt.date) -> int:
-    """Fetch additional articles from external sources"""
-    new_count = 0
-    
-    # Google News
-    try:
-        google_news = GNews(language="en", max_results=50)
-        google_news.start_date = (start_date.year, start_date.month, start_date.day)
-        google_news.end_date = (end_date.year, end_date.month, end_date.day)
-        
-        news_results = google_news.get_news(query)
-        for article in news_results:
-            try:
-                safe_db_execute(
-                    "INSERT OR IGNORE INTO articles (title, summary, published, link, source, content) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        article.get("title", ""),
-                        article.get("description", ""),
-                        article.get("published date", dt.datetime.utcnow().isoformat()),
-                        article.get("url", ""),
-                        "Google News",
-                        article.get("description", "")
-                    )
-                )
-                new_count += 1
-            except:
-                continue
-    except:
-        pass
-    
-    return new_count
-
-# ========================== SENTIMENT ANALYSIS ==========================
+# ========================== FIXED FINBERT SENTIMENT ==========================
 
 @st.cache_resource
 def load_finbert():
-    """Load FinBERT model for sentiment analysis"""
     try:
         tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
         model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
@@ -392,391 +220,936 @@ def load_finbert():
         st.error(f"Failed to load FinBERT: {e}")
         return None, None, None
 
-def analyze_sentiment_batch(texts: List[str]) -> List[Dict[str, Any]]:
-    """Analyze sentiment for a batch of texts"""
+def finbert_sentiment(texts: List[str]) -> List[dict]:
     if not texts:
         return []
     
     tokenizer, model, device = load_finbert()
     
-    # Fallback if model not available
-    if tokenizer is None:
-        return [{"label": "neutral", "score": 0.8} for _ in texts]
+    # Fallback if model didn't load properly
+    if tokenizer is None or model is None:
+        return [{"label": "neutral", "score": 1.0}] * len(texts)
+    
+    # Better text preprocessing for financial news
+    processed_texts = []
+    for text in texts:
+        if not text or pd.isna(text):
+            processed_texts.append("")
+            continue
+        # Clean the text - remove extra spaces, truncate properly
+        clean_text = ' '.join(str(text).split())[:512]  # Limit length
+        processed_texts.append(clean_text)
+    
+    # Remove empty texts
+    valid_texts = [t for t in processed_texts if t.strip()]
+    if not valid_texts:
+        return [{"label": "neutral", "score": 1.0}] * len(texts)
     
     try:
-        # Process in batches
-        batch_size = 32
+        enc = tokenizer(
+            valid_texts,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model(**enc)
+            probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
+
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
         results = []
+        for p in probs:
+            idx = int(np.argmax(p))
+            results.append({"label": id2label[idx], "score": float(p[idx])})
         
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            
-            # Clean and prepare texts
-            cleaned_texts = []
-            for text in batch_texts:
-                if not text or pd.isna(text):
-                    cleaned_texts.append("No content")
-                else:
-                    cleaned_text = ' '.join(str(text).split())[:400]
-                    cleaned_texts.append(cleaned_text)
-            
-            # Tokenize and predict
-            encodings = tokenizer(
-                cleaned_texts,
-                padding=True,
-                truncation=True,
-                max_length=256,
-                return_tensors="pt"
-            ).to(device)
-            
-            with torch.no_grad():
-                outputs = model(**encodings)
-                probabilities = torch.softmax(outputs.logits, dim=1).cpu().numpy()
-            
-            # Convert to labels
-            id2label = {0: "negative", 1: "neutral", 2: "positive"}
-            for prob in probabilities:
-                label_idx = np.argmax(prob)
-                results.append({
-                    "label": id2label[label_idx],
-                    "score": float(prob[label_idx])
-                })
-        
-        return results
+        # Handle any texts that were filtered out
+        final_results = []
+        result_idx = 0
+        for i, text in enumerate(processed_texts):
+            if text.strip():  # Valid text
+                final_results.append(results[result_idx])
+                result_idx += 1
+            else:  # Empty text - default to neutral
+                final_results.append({"label": "neutral", "score": 1.0})
+                
+        return final_results
         
     except Exception as e:
-        st.error(f"Sentiment analysis error: {e}")
-        # Return neutral as fallback
-        return [{"label": "neutral", "score": 0.8} for _ in texts]
+        # Fallback: return all neutral
+        return [{"label": "neutral", "score": 1.0}] * len(texts)
 
-# ========================== DASHBOARD COMPONENTS ==========================
+# ========================== EMBEDDINGS ==========================
 
-def create_sentiment_metrics(df: pd.DataFrame) -> Dict[str, Any]:
-    """Calculate sentiment metrics"""
+def get_embedding(text: str) -> List[float]:
+    client = get_openai_client()
+    text = text.replace("\n", " ")
+    emb = client.embeddings.create(
+        model=OPENAI_EMBED_MODEL,
+        input=text
+    )
+    return emb.data[0].embedding
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+# ========================== RSS INGESTION ==========================
+
+def parse_rss(url: str) -> List[dict]:
+    feed = feedparser.parse(url)
+    articles = []
+    for entry in feed.entries:
+        title = entry.get("title", "").strip()
+        summary = entry.get("summary", "").strip()
+        link = entry.get("link", "")
+
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            pub = dt.datetime(*entry.published_parsed[:6])
+        else:
+            pub = dt.datetime.utcnow()
+        published = pub.isoformat()
+
+        # Better content extraction
+        content = ""
+        if summary and len(summary) > 50:  # Only use substantial summaries
+            content = summary
+        elif "content" in entry and entry.content:
+            # Try to get the longest content available
+            contents = [c.value for c in entry.content if hasattr(c, 'value')]
+            if contents:
+                content = max(contents, key=len)
+        
+        # If still no good content, use title
+        if not content or len(content) < 20:
+            content = title
+
+        articles.append({
+            "title": title,
+            "summary": summary,
+            "published": published,
+            "link": link,
+            "source": url,
+            "content": content,
+        })
+    return articles
+
+def fetch_rss_articles() -> int:
+    new_count = 0
+    for url in RSS_FEEDS:
+        try:
+            arts = parse_rss(url)
+        except Exception:
+            continue
+        for art in arts:
+            try:
+                safe_execute(
+                    """
+                    INSERT OR IGNORE INTO articles
+                    (title, summary, published, link, source, content, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        art["title"],
+                        art["summary"],
+                        art["published"],
+                        art["link"],
+                        art["source"],
+                        art["content"],
+                    ),
+                )
+                new_count += 1
+            except Exception:
+                pass
+    return new_count
+
+# ========================== GDELT INGESTION ==========================
+
+def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
+    """
+    Pulls articles from GDELT 2.0 DOC API for a given query and date range.
+    """
+    new_count = 0
+
+    start_str = start.strftime("%Y%m%d000000")
+    end_str = end.strftime("%Y%m%d235959")
+
+    base_url = (
+        "https://api.gdeltproject.org/api/v2/doc/doc"
+        f"?query={requests.utils.quote(query)}"
+        f"&mode=artlist&maxrecords={GDELT_MAX_RECORDS}&format=json"
+        f"&startdatetime={start_str}&enddatetime={end_str}"
+    )
+
+    try:
+        r = requests.get(base_url, timeout=15)
+        if r.status_code != 200:
+            return 0
+        data = r.json()
+        articles = data.get("articles", [])
+    except Exception:
+        return 0
+
+    for a in articles:
+        title = a.get("title", "")
+        summary = a.get("seendate", "")
+        link = a.get("url", "")
+        src = a.get("domain", "gdelt")
+        seen = a.get("seendate", "")
+        try:
+            published = dt.datetime.strptime(seen, "%Y%m%d%H%M%S").isoformat()
+        except Exception:
+            published = dt.datetime.utcnow().isoformat()
+        content = a.get("snippet", "") or summary
+
+        try:
+            safe_execute(
+                """
+                INSERT OR IGNORE INTO articles
+                (title, summary, published, link, source, content, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (title, summary, published, link, src, content),
+            )
+            new_count += 1
+        except Exception:
+            pass
+
+    return new_count
+
+# ========================== GOOGLE NEWS (GNews) ==========================
+
+def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
+    new_count = 0
+
+    try:
+        gn = GNews(language="en", max_results=GNEWS_MAX_RESULTS)
+        gn.start_date = (start.year, start.month, start.day)
+        gn.end_date = (end.year, end.month, end.day)
+        results = gn.get_news(query)
+    except Exception:
+        return 0
+
+    for r in results:
+        title = r.get("title", "")
+        link = r.get("url") or r.get("link", "")
+        pub = r.get("published date") or r.get("published_date")
+        desc = r.get("description", "")
+        source = r.get("publisher", {}).get("title", "google-news")
+
+        try:
+            published = str(pub) if pub else dt.datetime.utcnow().isoformat()
+        except Exception:
+            published = dt.datetime.utcnow().isoformat()
+
+        content = desc
+
+        try:
+            safe_execute(
+                """
+                INSERT OR IGNORE INTO articles
+                (title, summary, published, link, source, content, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (title, desc, published, link, source, content),
+            )
+            new_count += 1
+        except Exception:
+            pass
+
+    return new_count
+
+# ========================== EMBEDDING MANAGEMENT ==========================
+
+def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, summary, published, link, source, content, embedding
+        FROM articles
+        WHERE date(published) BETWEEN ? AND ?
+        """,
+        (start.isoformat(), end.isoformat()),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "id",
+            "title",
+            "summary",
+            "published",
+            "link",
+            "source",
+            "content",
+            "embedding",
+        ],
+    )
+    return df
+
+def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
+    """
+    Add embeddings for rows that don't have them yet.
+    Uses safe_execute to avoid DB locking.
+    """
+    for _, row in df_ids_title_summary.iterrows():
+        if row["embedding"] is None:
+            text = (row["title"] or "") + " " + (row["summary"] or "")
+            if not text.strip():
+                continue
+            emb = get_embedding(text)
+            safe_execute(
+                "UPDATE articles SET embedding = ? WHERE id = ?",
+                (json.dumps(emb), int(row["id"])),
+            )
+
+# ========================== SEMANTIC SEARCH MULTI ==========================
+
+def semantic_search_multi(
+    queries: List[str],
+    start: dt.date,
+    end: dt.date,
+    top_k: int,
+    min_sim: float = MIN_SIMILARITY,
+) -> pd.DataFrame:
+    """
+    Semantic-first hybrid search using ALL expanded queries together.
+    """
+    df = load_articles_for_range(start, end)
+    if df.empty:
+        return df
+
+    # Normalise embedding column
+    df["embedding"] = df["embedding"].apply(
+        lambda x: None if x in (None, "", "NULL") else x
+    )
+
+    # Ensure every article has an embedding
+    ensure_embeddings(df[["id", "title", "summary", "embedding"]])
+
+    # Reload to get fresh embeddings
+    df = load_articles_for_range(start, end)
+    if df.empty:
+        return df
+
+    # Build article embedding matrix
+    emb_list = []
+    valid_idx = []
+    for idx, row in df.iterrows():
+        try:
+            vec = np.array(json.loads(row["embedding"]), dtype=float)
+            emb_list.append(vec)
+            valid_idx.append(idx)
+        except Exception:
+            emb_list.append(None)
+
+    if not emb_list:
+        return pd.DataFrame()
+
+    emb_mat = np.vstack([e for e in emb_list if e is not None])
+    article_norms = np.linalg.norm(emb_mat, axis=1)
+    article_norms[article_norms == 0] = 1e-8
+
+    # Build combined query embedding (average of all expanded queries)
+    clean_queries = [q.strip() for q in queries if q and q.strip()]
+    if not clean_queries:
+        return pd.DataFrame()
+
+    q_vecs = []
+    for q in clean_queries:
+        q_vecs.append(np.array(get_embedding(q), dtype=float))
+    q_mat = np.vstack(q_vecs)
+    q_mean = q_mat.mean(axis=0)
+    q_norm = np.linalg.norm(q_mean)
+    if q_norm == 0:
+        q_norm = 1e-8
+
+    # Cosine similarities
+    sims = (emb_mat @ q_mean) / (article_norms * q_norm)
+
+    # Put similarities back into df
+    df = df.iloc[valid_idx].copy()
+    df["similarity"] = sims
+
+    # Keyword mask over ALL queries
+    q_terms = [q.lower() for q in clean_queries]
+
+    def contains_any(text: str) -> bool:
+        t = (text or "").lower()
+        return any(term in t for term in q_terms)
+
+    kw_mask = (
+        df["title"].apply(contains_any)
+        | df["summary"].apply(contains_any)
+        | df["content"].apply(contains_any)
+    )
+
+    # Semantic mask
+    sem_mask = df["similarity"] >= min_sim
+
+    # Give a small boost to articles that also match keywords
+    df.loc[kw_mask, "similarity"] = df.loc[kw_mask, "similarity"] + 0.05
+
+    # Decide which rows to keep
+    base_mask = sem_mask | kw_mask
+    if base_mask.any():
+        filtered = df[base_mask].copy()
+        filtered["match_type"] = np.where(
+            kw_mask[base_mask] & sem_mask[base_mask],
+            "keyword+semantic",
+            np.where(kw_mask[base_mask], "keyword", "semantic"),
+        )
+    else:
+        # Fallback: just take best semantic matches
+        filtered = df.copy()
+        filtered["match_type"] = "semantic"
+
+    filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
+    return filtered
+
+# ========================== LLM QUERY EXPANSION ==========================
+
+def expand_query_with_llm(query: str) -> List[str]:
+    """
+    Use LLM to generate related terms for the user's query.
+    """
+    client = get_openai_client()
+
+    prompt = f"""
+You are helping expand a financial news search query.
+
+Original query: "{query}"
+
+Generate 8-12 alternative search terms that:
+- mean the same
+- are closely related industries
+- include broader and narrower concepts
+- include common synonyms
+
+Return ONLY a valid JSON list of strings, like:
+["term1", "term2", "term3"]
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You generate semantic search expansions."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content.strip()
+        expansions = json.loads(content)
+        expansions = [str(t) for t in expansions if isinstance(t, str)]
+        # always include original query as first term
+        return [query] + expansions
+    except Exception:
+        return [query]
+
+# ========================== LLM ARTICLE SELECTION ==========================
+
+def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Let the LLM decide which of the already-matched articles
+    are truly relevant to the user's topic.
+    """
+    if df.empty:
+        return df
+
+    client = get_openai_client()
+
+    # Prepare lightweight list
+    items = [
+        {
+            "id": int(row["id"]),
+            "title": row["title"],
+            "summary": (row["summary"] or "")[:250],
+        }
+        for _, row in df.iterrows()
+    ]
+
+    prompt = f"""
+You are an article relevance filter for a financial news dashboard.
+
+The user topic is: "{query}"
+
+Below is a list of articles with IDs, titles, and summaries.
+
+Decide which articles are truly relevant to this topic.
+Return ONLY a JSON list of the IDs to KEEP.
+Do NOT include any explanation text, just the JSON list.
+
+Articles:
+{json.dumps(items, indent=2)}
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You select relevant financial news articles."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content.strip()
+        selected_ids = json.loads(content)
+        if not isinstance(selected_ids, list):
+            return df
+        selected_ids = set(int(i) for i in selected_ids)
+        return df[df["id"].isin(selected_ids)]
+    except Exception:
+        # if anything goes wrong, just return original df
+        return df
+
+# ========================== KEYWORDS & SENTIMENT INDEX ==========================
+
+def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]]:
+    text = " ".join(titles).lower()
+    words = re.findall(r"[a-zA-Z]{4,}", text)
+    stop = {
+        "this",
+        "that",
+        "with",
+        "from",
+        "will",
+        "have",
+        "been",
+        "into",
+        "after",
+        "over",
+        "under",
+        "they",
+        "them",
+        "your",
+        "their",
+        "about",
+        "which",
+        "there",
+        "where",
+        "when",
+        "than",
+        "because",
+        "while",
+        "before",
+        "through",
+        "within",
+        "without",
+    }
+    words = [w for w in words if w not in stop]
+    counter = Counter(words)
+    return counter.most_common(n)
+
+def calculate_sentiment_index(df: pd.DataFrame) -> float:
+    pos = len(df[df["sentiment_label"] == "positive"])
+    neg = len(df[df["sentiment_label"] == "negative"])
     total = len(df)
     if total == 0:
-        return {
-            "total": 0,
-            "positive": 0, "positive_pct": 0,
-            "negative": 0, "negative_pct": 0, 
-            "neutral": 0, "neutral_pct": 0,
-            "sentiment_index": 0.0
-        }
-    
-    sentiment_counts = df["sentiment_label"].value_counts()
-    positive = sentiment_counts.get("positive", 0)
-    negative = sentiment_counts.get("negative", 0)
-    neutral = sentiment_counts.get("neutral", 0)
-    
-    sentiment_index = ((positive - negative) / total) * 100
-    
-    return {
-        "total": total,
-        "positive": positive, "positive_pct": (positive / total) * 100,
-        "negative": negative, "negative_pct": (negative / total) * 100,
-        "neutral": neutral, "neutral_pct": (neutral / total) * 100,
-        "sentiment_index": sentiment_index
-    }
+        return 0.0
+    index = ((pos - neg) / total) * 100
+    return round(index, 2)
 
-def create_sentiment_charts(metrics: Dict[str, Any], df: pd.DataFrame):
-    """Create sentiment visualization charts"""
-    # Pie chart
-    fig_pie = px.pie(
-        names=["Positive", "Negative", "Neutral"],
-        values=[metrics["positive"], metrics["negative"], metrics["neutral"]],
-        color=["Positive", "Negative", "Neutral"],
-        color_discrete_map={"Positive": "#2ecc71", "Negative": "#e74c3c", "Neutral": "#95a5a6"},
-        hole=0.4
-    )
-    fig_pie.update_layout(title="Sentiment Distribution")
-    
-    # Gauge chart
-    fig_gauge = go.Figure(go.Indicator(
+# ========================== PREMIUM VISUALIZATIONS ==========================
+
+def create_luxury_gauge(value: float, title: str):
+    """Create premium gauge chart"""
+    fig = go.Figure(go.Indicator(
         mode="gauge+number+delta",
-        value=metrics["sentiment_index"],
-        title={"text": "Sentiment Index"},
-        delta={"reference": 0},
+        value=value,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': title, 'font': {'size': 20, 'color': 'white', 'family': "Arial Black"}},
+        delta={'reference': 0, 'increasing': {'color': "#00FF87"}, 'font': {'size': 16}},
         gauge={
-            "axis": {"range": [-100, 100]},
-            "bar": {"color": "#2ecc71" if metrics["sentiment_index"] > 0 else "#e74c3c"},
-            "steps": [
-                {"range": [-100, 0], "color": "lightgray"},
-                {"range": [0, 100], "color": "lightgreen"}
-            ]
-        }
-    ))
-    fig_gauge.update_layout(height=300)
+            'axis': {'range': [-100, 100], 'tickwidth': 1, 'tickcolor': "gold", 'tickfont': {'color': 'white', 'size': 12}},
+            'bar': {'color': "linear-gradient(90deg, #FF6B6B, #FFD93D, #00FF87)"},
+            'bgcolor': "rgba(0,0,0,0)",
+            'borderwidth': 2,
+            'bordercolor': "gold",
+            'steps': [
+                {'range': [-100, -33], 'color': 'rgba(255, 107, 107, 0.3)'},
+                {'range': [-33, 33], 'color': 'rgba(255, 217, 61, 0.3)'},
+                {'range': [33, 100], 'color': 'rgba(0, 255, 135, 0.3)'}],
+            'threshold': {
+                'line': {'color': "white", 'width': 4},
+                'thickness': 0.75,
+                'value': value}}))
     
-    return fig_pie, fig_gauge
+    fig.update_layout(
+        height=300,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font={'color': "white", 'family': "Arial"},
+        margin=dict(t=60, b=10, l=10, r=10)
+    )
+    return fig
+
+def create_premium_pie_chart(positive: int, negative: int, neutral: int):
+    """Create luxury pie chart"""
+    colors = ['#00FF87', '#FF6B6B', '#FFD93D']
+    fig = px.pie(
+        values=[positive, negative, neutral],
+        names=['Positive', 'Negative', 'Neutral'],
+        color=['Positive', 'Negative', 'Neutral'],
+        color_discrete_map={'Positive': colors[0], 'Negative': colors[1], 'Neutral': colors[2]},
+        hole=0.6
+    )
+    
+    fig.update_traces(
+        textposition='inside',
+        textinfo='percent+label',
+        marker=dict(line=dict(color='gold', width=2)),
+        hoverinfo='label+percent+value'
+    )
+    
+    fig.update_layout(
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font={'color': 'white', 'size': 14, 'family': "Arial"},
+        margin=dict(t=40, b=40, l=40, r=40),
+        height=350
+    )
+    
+    return fig
+
+# ========================== PREMIUM DASHBOARD COMPONENTS ==========================
+
+def create_metric_card(value, label, delta=None, delta_color="normal"):
+    """Create premium metric card"""
+    delta_color_map = {
+        "normal": "",
+        "inverse": "color: #FF6B6B" if float(delta or 0) < 0 else "color: #00FF87"
+    }
+    
+    card_html = f"""
+    <div class="metric-card">
+        <div style="font-size: 2.5rem; font-weight: 800; background: linear-gradient(90deg, #FFD700, #FFA500); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+            {value}
+        </div>
+        <div style="font-size: 1rem; color: #CCCCCC; margin-bottom: 8px;">{label}</div>
+        {f'<div style="font-size: 0.9rem; {delta_color_map[delta_color]}">{"+" if float(delta or 0) > 0 else ""}{delta}</div>' if delta else ''}
+    </div>
+    """
+    return card_html
 
 # ========================== STREAMLIT APP ==========================
 
 def main():
     st.set_page_config(
-        page_title="Financial News Sentiment Dashboard",
+        page_title="Quantum Sentiment Pro",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="expanded",
+        page_icon="🚀"
     )
     
-    st.title("📈 Financial News Sentiment Dashboard")
-    st.markdown("""
-    **SMART QUERY SYSTEM** - Understands meaning, not just keywords  
-    **LLM-BASED SELECTION** - Semantic article matching  
-    **FINBERT SENTIMENT** - Financial-specific sentiment analysis  
-    **FUSED OUTPUT** - Comprehensive results with trends and insights
-    """)
+    apply_premium_styling()
     
-    # Sidebar
-    with st.sidebar:
-        st.header("Data Management")
-        
-        if st.button("🔄 Update RSS Feeds", use_container_width=True):
-            with st.spinner("Fetching latest articles..."):
-                new_count = fetch_rss_articles()
-                st.success(f"Added {new_count} new articles")
-        
-        st.header("Search Settings")
-        
-        today = dt.date.today()
-        start_date = st.date_input("Start Date", today - dt.timedelta(days=30))
-        end_date = st.date_input("End Date", today)
-        
-        use_external_sources = st.checkbox("Include External Sources", value=True)
-        max_articles = st.slider("Max Articles", 50, 500, 200)
-    
-    # Main search interface
-    st.subheader("🔍 Semantic Search")
-    
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col1:
-        query = st.text_input(
-            "Enter your topic:",
-            placeholder="e.g., US Tech, Nvidia, European textiles, AI semiconductor...",
-            key="search_query"
-        )
+    # Premium Header
+    col1, col2, col3 = st.columns([2, 3, 1])
     with col2:
-        search_clicked = st.button("🚀 Analyze", type="primary", use_container_width=True)
-    with col3:
-        clear_clicked = st.button("🗑️ Clear", use_container_width=True)
+        st.markdown("""
+        <div style="text-align: center; padding: 2rem 0;">
+            <h1 style="font-size: 3.5rem; margin-bottom: 0.5rem; background: linear-gradient(90deg, #FFD700, #FFA500, #FF6B6B); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+                QUANTUM SENTIMENT PRO
+            </h1>
+            <p style="font-size: 1.2rem; color: #CCCCCC; font-style: italic;">
+                Enterprise-Grade Financial Intelligence Platform
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Sidebar - Luxury Design
+    with st.sidebar:
+        st.markdown("""
+        <div style="padding: 2rem 1rem; text-align: center;">
+            <h2 style="background: linear-gradient(90deg, #FFD700, #FFA500); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+                QUANTUM CONTROL
+            </h2>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Data Management Section
+        st.markdown("### 📊 DATA MANAGEMENT")
+        if st.button("🔄 SYNC MARKET DATA", use_container_width=True, type="primary"):
+            with st.spinner("🔄 Synchronizing global market feeds..."):
+                new_count = fetch_rss_articles()
+                if new_count > 0:
+                    st.success(f"✅ Synced {new_count} premium articles")
+                else:
+                    st.info("💎 Database already synchronized")
+        
+        st.markdown("---")
+        
+        # Search Configuration
+        st.markdown("### 🎯 SEARCH CONFIGURATION")
+        today = dt.date.today()
+        start_date = st.date_input("📅 ANALYSIS PERIOD START", today - dt.timedelta(days=30))
+        end_date = st.date_input("📅 ANALYSIS PERIOD END", today)
+        
+        st.markdown("### ⚙️ ADVANCED SETTINGS")
+        use_external_sources = st.toggle("🌐 ENABLE GLOBAL SOURCES", value=True)
+        max_articles = st.slider("📈 MAX ARTICLES ANALYSIS", 100, 1000, 500, 50)
+        
+        st.markdown("---")
+        st.markdown("""
+        <div style="text-align: center; color: #888; font-size: 0.8rem;">
+            <p>QUANTUM SENTIMENT PRO™</p>
+            <p>Enterprise Edition</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Main Search Interface - Luxury Design
+    st.markdown("### 🔍 QUANTUM SEARCH ENGINE")
+    
+    search_col1, search_col2, search_col3 = st.columns([3, 1, 1])
+    
+    with search_col1:
+        query = st.text_input(
+            " ",
+            placeholder="🔮 Enter market topic (e.g., US Tech, AI Revolution, Quantum Computing...)",
+            key="search_query",
+            label_visibility="collapsed"
+        )
+    
+    with search_col2:
+        search_clicked = st.button("🚀 LAUNCH ANALYSIS", type="primary", use_container_width=True)
+    
+    with search_col3:
+        clear_clicked = st.button("🔄 RESET", use_container_width=True)
     
     if clear_clicked:
         st.rerun()
     
     if not search_clicked or not query.strip():
-        st.info("💡 Enter a search topic and click 'Analyze' to see sentiment insights")
+        st.markdown("""
+        <div style="text-align: center; padding: 4rem; background: rgba(255,255,255,0.05); border-radius: 15px; border: 1px solid rgba(255,215,0,0.2);">
+            <h3 style="color: #FFD700; margin-bottom: 1rem;">💎 WELCOME TO QUANTUM SENTIMENT PRO</h3>
+            <p style="color: #CCCCCC;">Enter a market topic above to unleash the power of AI-driven sentiment intelligence</p>
+        </div>
+        """, unsafe_allow_html=True)
         return
     
-    # Process query
-    with st.spinner("🔍 Expanding search terms..."):
-        expanded_queries = expand_query_advanced(query)
-    
-    st.success(f"**Expanded to {len(expanded_queries)} search terms**")
-    st.write("📋 Search terms:", ", ".join(expanded_queries))
-    
-    # Fetch additional data if requested
-    if use_external_sources:
-        with st.spinner("🌐 Fetching additional articles..."):
-            for search_term in expanded_queries[:5]:  # Limit to first 5 terms
-                fetch_external_articles(search_term, start_date, end_date)
-    
-    # Perform semantic search
-    with st.spinner("🎯 Finding relevant articles..."):
-        results_df = hybrid_semantic_search(expanded_queries, start_date, end_date, max_articles)
-    
-    if results_df.empty:
-        st.error("❌ No relevant articles found. Try broadening your search or date range.")
-        return
-    
-    st.success(f"✅ Found {len(results_df)} relevant articles")
-    
-    # Sentiment analysis
-    with st.spinner("😊 Analyzing sentiment with FinBERT..."):
-        # Prepare texts for analysis
-        analysis_texts = []
+    # Analysis Process
+    with st.status("🚀 INITIATING QUANTUM ANALYSIS...", expanded=True) as status:
+        status.update(label="🔄 Expanding search universe...")
+        expanded_queries = expand_query_with_llm(query)
+        
+        status.update(label="🌐 Accessing global data streams...")
+        external_count = 0
+        if use_external_sources:
+            for search_term in expanded_queries[:8]:
+                external_count += fetch_gdelt_articles(search_term, start_date, end_date)
+                external_count += fetch_gnews_articles(search_term, start_date, end_date)
+        
+        status.update(label="🎯 Executing semantic intelligence...")
+        results_df = semantic_search_multi(expanded_queries, start_date, end_date, max_articles)
+        
+        if results_df.empty:
+            status.update(label="❌ Analysis complete - No significant data found", state="error")
+            st.error("No relevant articles found. Try expanding your search criteria.")
+            return
+        
+        status.update(label="🔍 Applying precision filtering...")
+        results_df = llm_select_articles(query, results_df)
+        
+        status.update(label="😊 Deploying sentiment analysis matrix...")
+        # Use both title and content for better sentiment analysis
+        texts = []
         for _, row in results_df.iterrows():
-            text = f"{row['title']} {row['summary']}".strip()
-            analysis_texts.append(text)
+            content = row["content"] if pd.notna(row["content"]) else ""
+            title = row["title"] if pd.notna(row["title"]) else ""
+            # Combine title and first 200 chars of content
+            combined_text = f"{title}. {content}"[:300]
+            texts.append(combined_text)
         
-        sentiment_results = analyze_sentiment_batch(analysis_texts)
+        sentiment_results = finbert_sentiment(texts)
         
-        # Add sentiment to dataframe
-        results_df["sentiment_label"] = [r["label"] for r in sentiment_results]
-        results_df["sentiment_score"] = [r["score"] for r in sentiment_results]
-        results_df["relevance_score"] = (results_df["combined_score"] * 100).round(1)
+        results_df["sentiment_label"] = [s["label"] for s in sentiment_results]
+        results_df["sentiment_score"] = [s["score"] for s in sentiment_results]
+        results_df["relevance"] = (results_df["similarity"] * 100).round(1)
+        results_df["source_domain"] = results_df["source"].fillna("").replace("", "unknown")
+        
+        status.update(label=f"✅ QUANTUM ANALYSIS COMPLETE - {len(results_df)} assets processed", state="complete")
     
-    # Calculate metrics
-    metrics = create_sentiment_metrics(results_df)
+    # Results Header
+    st.success(f"**💎 QUANTUM INTELLIGENCE REPORT: {len(results_df)} Market Signals Processed**")
     
-    # Display results in tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Dashboard", 
-        "📰 Articles", 
-        "🔍 Analysis", 
-        "📥 Export"
-    ])
+    # Premium Metrics Row
+    total = len(results_df)
+    sentiment_counts = results_df["sentiment_label"].value_counts()
+    positive = sentiment_counts.get("positive", 0)
+    negative = sentiment_counts.get("negative", 0)
+    neutral = sentiment_counts.get("neutral", 0)
+    sentiment_index = calculate_sentiment_index(results_df)
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.markdown(create_metric_card(total, "TOTAL SIGNALS"), unsafe_allow_html=True)
+    with col2:
+        st.markdown(create_metric_card(positive, "BULLISH", f"+{positive/total*100:.1f}%"), unsafe_allow_html=True)
+    with col3:
+        st.markdown(create_metric_card(negative, "BEARISH", f"{negative/total*100:.1f}%", "inverse"), unsafe_allow_html=True)
+    with col4:
+        st.markdown(create_metric_card(neutral, "NEUTRAL", f"{neutral/total*100:.1f}%"), unsafe_allow_html=True)
+    with col5:
+        direction = "🚀" if sentiment_index > 0 else "📉"
+        st.markdown(create_metric_card(f"{sentiment_index:.1f}", f"SENTIMENT INDEX {direction}"), unsafe_allow_html=True)
+    
+    # Premium Visualization Section
+    st.markdown("---")
+    st.markdown("### 📊 QUANTUM VISUALIZATION MATRIX")
+    
+    viz_col1, viz_col2 = st.columns([1, 1])
+    
+    with viz_col1:
+        st.plotly_chart(create_premium_pie_chart(positive, negative, neutral), use_container_width=True)
+    
+    with viz_col2:
+        st.plotly_chart(create_luxury_gauge(sentiment_index, "MARKET SENTIMENT GAUGE"), use_container_width=True)
+    
+    # Advanced Analytics
+    st.markdown("### 🔬 ADVANCED ANALYTICS DASHBOARD")
+    
+    tab1, tab2, tab3, tab4 = st.tabs(["💎 MARKET INTELLIGENCE", "📈 SIGNAL STREAM", "🔍 DEEP ANALYSIS", "📊 EXPORT HUB"])
     
     with tab1:
-        # Key metrics
-        col1, col2, col3, col4, col5 = st.columns(5)
+        st.subheader("💎 Market Intelligence Overview")
         
-        with col1:
-            st.metric("Total Articles", metrics["total"])
-        with col2:
-            st.metric("Positive", f"{metrics['positive']} ({metrics['positive_pct']:.1f}%)")
-        with col3:
-            st.metric("Negative", f"{metrics['negative']} ({metrics['negative_pct']:.1f}%)")
-        with col4:
-            st.metric("Neutral", f"{metrics['neutral']} ({metrics['neutral_pct']:.1f}%)")
-        with col5:
-            direction = "Bullish" if metrics["sentiment_index"] > 0 else "Bearish"
-            st.metric("Sentiment Index", f"{metrics['sentiment_index']:.1f}", direction)
-        
-        st.markdown("---")
-        
-        # Charts
-        fig_pie, fig_gauge = create_sentiment_charts(metrics, results_df)
-        
+        # Create advanced charts
         col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(fig_pie, use_container_width=True)
-        with col2:
-            st.plotly_chart(fig_gauge, use_container_width=True)
         
-        # Additional insights
-        col1, col2 = st.columns(2)
         with col1:
-            st.subheader("📈 Sentiment Confidence")
-            avg_confidence = results_df.groupby("sentiment_label")["sentiment_score"].mean()
-            fig_conf = px.bar(
-                x=avg_confidence.index,
-                y=avg_confidence.values,
-                color=avg_confidence.index,
-                color_discrete_map={"positive": "#2ecc71", "negative": "#e74c3c", "neutral": "#95a5a6"}
+            # Sentiment distribution by source
+            source_sentiment = results_df.groupby(['source_domain', 'sentiment_label']).size().unstack(fill_value=0)
+            if not source_sentiment.empty:
+                fig_source = px.bar(
+                    source_sentiment,
+                    barmode='stack',
+                    color_discrete_map={'positive': '#00FF87', 'negative': '#FF6B6B', 'neutral': '#FFD93D'},
+                    title="Sentiment Distribution by Source"
+                )
+                fig_source.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font={'color': 'white'}
+                )
+                st.plotly_chart(fig_source, use_container_width=True)
+        
+        with col2:
+            # Confidence distribution
+            fig_conf = px.histogram(
+                results_df,
+                x='sentiment_score',
+                color='sentiment_label',
+                color_discrete_map={'positive': '#00FF87', 'negative': '#FF6B6B', 'neutral': '#FFD93D'},
+                title="Sentiment Confidence Distribution"
             )
-            fig_conf.update_layout(xaxis_title="Sentiment", yaxis_title="Average Confidence")
+            fig_conf.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font={'color': 'white'}
+            )
             st.plotly_chart(fig_conf, use_container_width=True)
-        
-        with col2:
-            st.subheader("🌐 Top Sources")
-            source_counts = results_df["source"].value_counts().head(10)
-            fig_sources = px.bar(
-                x=source_counts.values,
-                y=source_counts.index,
-                orientation='h',
-                title="Articles by Source"
-            )
-            st.plotly_chart(fig_sources, use_container_width=True)
     
     with tab2:
-        st.subheader("📋 Article List")
+        st.subheader("📈 Real-time Signal Stream")
         
         # Filter options
-        col1, col2 = st.columns(2)
-        with col1:
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
             sentiment_filter = st.multiselect(
-                "Filter by sentiment:",
+                "Filter Signals:",
                 options=["positive", "negative", "neutral"],
-                default=["positive", "negative", "neutral"]
+                default=["positive", "negative", "neutral"],
+                key="signal_filter"
             )
-        with col2:
-            sort_by = st.selectbox(
-                "Sort by:",
-                options=["Relevance", "Date", "Sentiment Confidence"],
-                index=0
+        with filter_col2:
+            sort_option = st.selectbox(
+                "Sort By:",
+                options=["Highest Relevance", "Latest", "Strongest Sentiment"],
+                key="signal_sort"
             )
         
-        # Filter and sort
+        # Display articles with premium styling
         filtered_df = results_df[results_df["sentiment_label"].isin(sentiment_filter)].copy()
         
-        if sort_by == "Relevance":
-            filtered_df = filtered_df.sort_values("relevance_score", ascending=False)
-        elif sort_by == "Date":
+        if sort_option == "Highest Relevance":
+            filtered_df = filtered_df.sort_values("relevance", ascending=False)
+        elif sort_option == "Latest":
             filtered_df = filtered_df.sort_values("published", ascending=False)
         else:
             filtered_df = filtered_df.sort_values("sentiment_score", ascending=False)
         
-        # Display articles
-        for _, article in filtered_df.iterrows():
-            sentiment_icon = {
-                "positive": "🟢", 
-                "negative": "🔴", 
-                "neutral": "🔵"
+        for idx, article in filtered_df.iterrows():
+            sentiment_color = {
+                "positive": "#00FF87",
+                "negative": "#FF6B6B", 
+                "neutral": "#FFD93D"
             }[article["sentiment_label"]]
             
             with st.container():
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.write(f"**{sentiment_icon} {article['title']}**")
-                    if article["summary"]:
-                        st.caption(article["summary"][:200] + "...")
-                with col2:
-                    st.caption(f"Relevance: {article['relevance_score']}%")
-                    st.caption(f"Sentiment: {article['sentiment_label']}")
-                    st.caption(f"Confidence: {article['sentiment_score']*100:.1f}%")
-                    st.markdown(f"[📖 Read]({article['link']})")
-                
-                st.markdown("---")
+                st.markdown(f"""
+                <div style="background: rgba(255,255,255,0.05); border-left: 4px solid {sentiment_color}; padding: 1.5rem; border-radius: 10px; margin: 10px 0; border: 1px solid rgba(255,215,0,0.1);">
+                    <h4 style="color: white; margin-bottom: 0.5rem;">{article['title']}</h4>
+                    <div style="display: flex; justify-content: space-between; color: #CCCCCC; font-size: 0.9rem;">
+                        <span>🔗 {article['source_domain']}</span>
+                        <span>🎯 Relevance: {article['relevance']}%</span>
+                        <span>😊 Sentiment: <span style="color: {sentiment_color}">{article['sentiment_label'].upper()}</span></span>
+                        <span>📊 Confidence: {article['sentiment_score']*100:.1f}%</span>
+                    </div>
+                    {f'<p style="color: #AAAAAA; margin-top: 0.5rem;">{article["summary"][:200]}...</p>' if article["summary"] else ''}
+                    <div style="margin-top: 0.5rem;">
+                        <a href="{article['link']}" target="_blank" style="color: #FFD700; text-decoration: none;">📖 Read Full Analysis →</a>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
     
     with tab3:
-        st.subheader("🔍 Detailed Analysis")
+        st.subheader("🔍 Deep Market Analysis")
         
         # Keyword analysis
-        st.write("### 📊 Trending Keywords")
-        all_titles = " ".join(results_df["title"].fillna("").tolist())
-        words = re.findall(r'\b[a-zA-Z]{4,}\b', all_titles.lower())
-        
-        stop_words = {"this", "that", "with", "from", "will", "have", "been", "their", "about", "would"}
-        filtered_words = [w for w in words if w not in stop_words]
-        
-        word_freq = Counter(filtered_words)
-        top_keywords = word_freq.most_common(15)
-        
-        if top_keywords:
-            keywords_df = pd.DataFrame(top_keywords, columns=["Keyword", "Frequency"])
-            fig_keywords = px.bar(
-                keywords_df,
-                x="Frequency",
-                y="Keyword",
-                orientation='h',
-                title="Most Frequent Keywords"
+        st.markdown("#### 📊 Trending Market Terminology")
+        keywords = extract_top_keywords(results_df["title"].tolist(), n=20)
+        if keywords:
+            kw_df = pd.DataFrame(keywords, columns=["Keyword", "Frequency"])
+            fig_keywords = px.treemap(
+                kw_df,
+                path=['Keyword'],
+                values='Frequency',
+                title="Market Terminology Cloud"
+            )
+            fig_keywords.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                font={'color': 'white'}
             )
             st.plotly_chart(fig_keywords, use_container_width=True)
         else:
             st.info("No significant keywords found")
-        
-        # Sentiment over time (if enough data)
-        if len(results_df) > 5:
-            st.write("### 📅 Sentiment Trend")
-            results_df["published_date"] = pd.to_datetime(results_df["published"]).dt.date
-            daily_sentiment = results_df.groupby("published_date")["sentiment_label"].value_counts().unstack(fill_value=0)
-            
-            if not daily_sentiment.empty:
-                fig_trend = px.line(
-                    daily_sentiment,
-                    title="Daily Sentiment Distribution"
-                )
-                st.plotly_chart(fig_trend, use_container_width=True)
     
     with tab4:
-        st.subheader("📥 Export Results")
+        st.subheader("📊 Quantum Export Hub")
         
-        # Prepare download data
+        # Export data
         export_df = results_df[[
-            "title", "summary", "published", "link", "source", 
-            "sentiment_label", "sentiment_score", "relevance_score"
+            "title", "summary", "published", "link", "source_domain", 
+            "sentiment_label", "sentiment_score", "relevance", "match_type"
         ]].copy()
         
-        st.write(f"**Export {len(export_df)} articles**")
+        st.markdown("#### 💾 Export Market Intelligence")
         
-        # Download buttons
         col1, col2 = st.columns(2)
         
         with col1:
             csv_data = export_df.to_csv(index=False)
             st.download_button(
-                "💾 Download CSV",
+                "📥 EXPORT CSV",
                 csv_data,
-                file_name=f"sentiment_analysis_{query.replace(' ', '_')}.csv",
+                file_name=f"quantum_sentiment_{query.replace(' ', '_')}.csv",
                 mime="text/csv",
                 use_container_width=True
             )
@@ -784,14 +1157,14 @@ def main():
         with col2:
             json_data = export_df.to_json(orient="records", indent=2)
             st.download_button(
-                "📄 Download JSON",
+                "📊 EXPORT JSON",
                 json_data,
-                file_name=f"sentiment_analysis_{query.replace(' ', '_')}.json",
+                file_name=f"quantum_sentiment_{query.replace(' ', '_')}.json",
                 mime="application/json",
                 use_container_width=True
             )
         
-        st.write("### Data Preview")
+        st.markdown("#### 📈 Data Preview")
         st.dataframe(export_df.head(10), use_container_width=True)
 
 if __name__ == "__main__":
