@@ -20,32 +20,60 @@ from langdetect.lang_detect_exception import LangDetectException
 
 from gnews import GNews
 from openai import OpenAI
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
 # ========================== CONFIG ==========================
 
 DB_PATH = "news_articles.db"
 
+# 25+ RSS FEEDS FOR MORE ARTICLES
 RSS_FEEDS = [
+    # Business & Finance
     "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.bbci.co.uk/news/technology/rss.xml",
     "https://www.cnbc.com/id/10001147/device/rss/rss.html",
+    "https://www.cnbc.com/id/19854910/device/rss/rss.html",  # Technology
+    "https://feeds.reuters.com/reuters/topNews",
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://feeds.reuters.com/reuters/technologyNews",
     "https://www.marketwatch.com/marketwatch/rss/topstories",
+    "https://www.marketwatch.com/marketwatch/rss/tech",
+    
+    # Technology
+    "https://techcrunch.com/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    "https://www.wired.com/feed/rss",
+    "https://arstechnica.com/feed/",
+    
+    # International
     "https://www.aljazeera.com/xml/rss/all.xml",
     "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-    "https://feeds.reuters.com/reuters/worldNews",
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/energyNews",
+    "https://economictimes.indiatimes.com/tech/rssfeeds/13357270.cms",
+    
+    # US News
+    "https://www.npr.org/rss/rss.php?id=1001",  # Business
+    "https://www.npr.org/rss/rss.php?id=1019",  # Technology
+    
+    # European
+    "https://www.dw.com/rss/rdf-en-business",
+    "https://www.dw.com/rss/rdf-en-science",
+    
+    # More sources
+    "https://www.engadget.com/rss.xml",
+    "https://www.zdnet.com/news/rss.xml",
+    "https://feeds.feedburner.com/TechCrunch/",
+    "https://www.bloomberg.com/technology/rss",
 ]
 
 OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
-# OPTIMIZED CONFIG
+# CONFIG
 MIN_SIMILARITY = 0.25
-MAX_ARTICLES_DEFAULT = 200
-GDELT_MAX_RECORDS = 100
-GNEWS_MAX_RESULTS = 100
+MAX_ARTICLES_DEFAULT = 500  # Increased from 200
+GDELT_MAX_RECORDS = 200
+GNEWS_MAX_RESULTS = 200
 
 # Fix: Initialize langdetect for consistent results
 DetectorFactory.seed = 0
@@ -62,7 +90,7 @@ def get_connection():
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA cache_size = -20000;")
+    conn.execute("PRAGMA cache_size = -50000;")  # Increased cache
 
     conn.execute(
         """
@@ -75,10 +103,17 @@ def get_connection():
             source TEXT,
             content TEXT,
             embedding TEXT,
-            language TEXT DEFAULT 'unknown'
+            language TEXT DEFAULT 'unknown',
+            processed INTEGER DEFAULT 0
         );
         """
     )
+    
+    # Create index for faster searches
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_published ON articles(published);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_language ON articles(language);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_processed ON articles(processed);")
+    
     conn.commit()
     return conn
 
@@ -122,255 +157,116 @@ def get_openai_client():
     return OpenAI(api_key=api_key)
 
 
-# ========================== SENTIMENT ANALYSIS (FIXED - BALANCED) ==========================
+# ========================== SENTIMENT ANALYSIS ==========================
 
 @st.cache_resource
-def load_sentiment_analyzers():
-    """Load multiple sentiment analyzers for balanced results"""
-    analyzers = {}
-    
-    try:
-        # 1. FinBERT (original)
-        finbert_tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
-        finbert_model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        finbert_model.to(device)
-        finbert_model.eval()
-        analyzers['finbert'] = (finbert_tokenizer, finbert_model, device)
-    except:
-        analyzers['finbert'] = None
-    
-    try:
-        # 2. General sentiment analyzer (fallback)
-        general_analyzer = pipeline("sentiment-analysis", 
-                                  model="distilbert-base-uncased-finetuned-sst-2-english",
-                                  truncation=True)
-        analyzers['general'] = general_analyzer
-    except:
-        analyzers['general'] = None
-    
-    return analyzers
+def load_finbert():
+    tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    return tokenizer, model, device
 
 
-def balanced_sentiment_analysis(texts: List[str]) -> List[dict]:
-    """
-    MAIN FIX: Ensures balanced sentiment distribution
-    Forces realistic mix even if all articles seem positive
-    """
+def finbert_sentiment(texts: List[str]) -> List[dict]:
     if not texts:
         return []
     
+    tokenizer, model, device = load_finbert()
+    enc = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=256,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**enc)
+        probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
+
+    id2label = {0: "negative", 1: "neutral", 2: "positive"}
     results = []
     
-    # Load analyzers
-    analyzers = load_sentiment_analyzers()
-    
-    # Negative keywords list
-    negative_keywords = [
-        'crash', 'fall', 'drop', 'plunge', 'decline', 'loss', 'lose',
-        'layoff', 'cut', 'miss', 'down', 'bear', 'recession', 'crisis',
-        'warn', 'warning', 'fear', 'concern', 'risk', 'slump', 'slow',
-        'weak', 'trouble', 'problem', 'issue', 'challenge', 'difficulty',
-        'struggle', 'fail', 'failure', 'sink', 'slide', 'dip', 'shrink',
-        'contract', 'negative', 'bearish', 'pessimistic', 'downturn',
-        'collapse', 'bankrupt', 'default', 'debt', 'inflation', 'unemployment'
-    ]
-    
-    # Positive keywords list  
-    positive_keywords = [
-        'rise', 'gain', 'surge', 'jump', 'grow', 'growth', 'profit',
-        'record', 'high', 'bull', 'optimistic', 'boost', 'recovery',
-        'strength', 'opportunity', 'increase', 'up', 'positive', 'bullish',
-        'strong', 'success', 'win', 'beat', 'exceed', 'outperform',
-        'expand', 'launch', 'innovate', 'breakthrough', 'milestone',
-        'achievement', 'dividend', 'buyback', 'acquisition', 'partnership'
-    ]
-    
-    # First pass: Use FinBERT if available
-    if analyzers.get('finbert'):
-        try:
-            tokenizer, model, device = analyzers['finbert']
-            enc = tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=256,
-                return_tensors="pt",
-            ).to(device)
-
-            with torch.no_grad():
-                outputs = model(**enc)
-                probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
-
-            id2label = {0: "negative", 1: "neutral", 2: "positive"}
-            
-            for i, p in enumerate(probs):
-                idx = int(np.argmax(p))
-                max_score = float(p[idx])
-                base_label = id2label[idx]
-                
-                # Check keyword signals
-                text_lower = texts[i].lower() if i < len(texts) else ""
-                neg_keyword_count = sum(1 for kw in negative_keywords if kw in text_lower)
-                pos_keyword_count = sum(1 for kw in positive_keywords if kw in text_lower)
-                
-                # STRONG FORCE: If negative keywords > positive keywords, make it negative
-                if neg_keyword_count > pos_keyword_count + 1:
-                    label = "negative"
-                    score = min(max_score, 0.75)
-                # If article has negative keywords at all, consider neutral
-                elif neg_keyword_count > 0 and base_label == "positive":
-                    label = "neutral"
-                    score = 0.5
-                else:
-                    # Regular FinBERT with calibration
-                    if max_score < 0.55:
-                        label = "neutral"
-                        score = 0.5
-                    else:
-                        label = base_label
-                        # Scale down extreme confidence
-                        if max_score > 0.85:
-                            score = max_score * 0.8
-                        elif max_score > 0.75:
-                            score = max_score * 0.85
-                        else:
-                            score = max_score
-                
-                results.append({"label": label, "score": score})
-                
-        except Exception as e:
-            # Fallback to general analyzer
-            if analyzers.get('general'):
-                raw_results = analyzers['general'](texts, truncation=True)
-                for r in raw_results:
-                    label_str = r['label'].lower()
-                    score = r['score']
-                    
-                    if 'positive' in label_str:
-                        label = "positive"
-                        score = min(score, 0.8)  # Cap confidence
-                    elif 'negative' in label_str:
-                        label = "negative"
-                        score = min(score, 0.8)
-                    else:
-                        label = "neutral"
-                        score = 0.5
-                    
-                    results.append({"label": label, "score": score})
-            else:
-                # Ultimate fallback: rule-based
-                return rule_based_sentiment(texts, negative_keywords, positive_keywords)
-    else:
-        # Fallback to general analyzer
-        if analyzers.get('general'):
-            raw_results = analyzers['general'](texts, truncation=True)
-            for r in raw_results:
-                label_str = r['label'].lower()
-                score = r['score']
-                
-                if 'positive' in label_str:
-                    label = "positive"
-                    score = min(score, 0.8)
-                elif 'negative' in label_str:
-                    label = "negative"
-                    score = min(score, 0.8)
-                else:
-                    label = "neutral"
-                    score = 0.5
-                
-                results.append({"label": label, "score": score})
+    for p in probs:
+        idx = int(np.argmax(p))
+        max_score = float(p[idx])
+        base_label = id2label[idx]
+        
+        # Balanced calibration
+        if max_score < 0.55:
+            label = "neutral"
+            score = 0.5
         else:
-            # Ultimate fallback: rule-based
-            return rule_based_sentiment(texts, negative_keywords, positive_keywords)
-    
-    # POST-PROCESSING: ENFORCE BALANCED DISTRIBUTION
-    if len(results) > 10:
-        # Count current distribution
-        labels = [r["label"] for r in results]
-        pos_count = labels.count("positive")
-        neg_count = labels.count("negative")
-        neu_count = labels.count("neutral")
-        total = len(results)
-        
-        # Target distribution for financial news: 50% positive, 30% neutral, 20% negative
-        target_pos = int(total * 0.5)
-        target_neu = int(total * 0.3)
-        target_neg = total - target_pos - target_neu
-        
-        # If distribution is unrealistic, adjust it
-        if pos_count / total > 0.7:  # More than 70% positive
-            # Convert some positives to neutral/negative
-            pos_indices = [i for i, r in enumerate(results) if r["label"] == "positive"]
-            
-            # Convert to neutral (middle of the list)
-            for i in pos_indices[target_pos:target_pos + target_neu - neu_count]:
-                if i < len(results):
-                    results[i]["label"] = "neutral"
-                    results[i]["score"] = 0.5
-            
-            # Convert to negative (end of the list)
-            for i in pos_indices[target_pos + target_neu - neu_count:target_pos + target_neu - neu_count + target_neg - neg_count]:
-                if i < len(results):
-                    results[i]["label"] = "negative"
-                    results[i]["score"] = 0.7
-        
-        elif neg_count / total > 0.4:  # More than 40% negative
-            # Convert some negatives to neutral
-            neg_indices = [i for i, r in enumerate(results) if r["label"] == "negative"]
-            for i in neg_indices[target_neg:]:
-                if i < len(results):
-                    results[i]["label"] = "neutral"
-                    results[i]["score"] = 0.5
-    
-    return results
-
-
-def rule_based_sentiment(texts: List[str], negative_keywords: List[str], positive_keywords: List[str]) -> List[dict]:
-    """Rule-based sentiment as last resort"""
-    results = []
-    
-    for i, text in enumerate(texts):
-        text_lower = text.lower()
-        
-        # Count keywords
-        pos_count = sum(1 for kw in positive_keywords if kw in text_lower)
-        neg_count = sum(1 for kw in negative_keywords if kw in text_lower)
-        
-        # Determine sentiment
-        if neg_count > pos_count + 1:  # Clear negative
-            label = "negative"
-            score = 0.7
-        elif pos_count > neg_count + 1:  # Clear positive
-            label = "positive"
-            score = 0.7
-        elif abs(pos_count - neg_count) <= 1:  # Balanced
-            label = "neutral"
-            score = 0.5
-        elif neg_count > 0:  # Has negative keywords
-            label = "neutral"
-            score = 0.5
-        else:  # Default to neutral
-            label = "neutral"
-            score = 0.5
-        
-        # Force diversity based on position
-        batch_pos = i / len(texts)
-        if batch_pos < 0.15:  # First 15% get some negatives
-            if i % 3 == 0:
-                label = "negative"
-                score = 0.7
-        elif batch_pos > 0.85:  # Last 15% get some negatives
-            if i % 4 == 0:
-                label = "negative"
-                score = 0.7
+            label = base_label
+            # Scale down extreme confidences
+            if max_score > 0.85:
+                score = max_score * 0.8
+            elif max_score > 0.75:
+                score = max_score * 0.85
+            else:
+                score = max_score
         
         results.append({"label": label, "score": score})
     
     return results
 
 
-# ========================== LANGUAGE DETECTION ==========================
+# ========================== BULK RSS FETCHER ==========================
+
+def fetch_all_rss_feeds():
+    """Fetch ALL RSS feeds to build large database"""
+    total_added = 0
+    
+    with st.spinner(f"Fetching from {len(RSS_FEEDS)} sources... This may take 1-2 minutes"):
+        progress_bar = st.progress(0)
+        
+        for i, url in enumerate(RSS_FEEDS):
+            try:
+                feed = feedparser.parse(url)
+                articles_added = 0
+                
+                for entry in feed.entries[:50]:  # Get up to 50 per feed
+                    title = entry.get("title", "")
+                    summary = entry.get("summary", "")
+                    link = entry.get("link", "")
+
+                    if hasattr(entry, "published_parsed") and entry.published_parsed:
+                        pub = dt.datetime(*entry.published_parsed[:6])
+                    else:
+                        pub = dt.datetime.utcnow()
+                    published = pub.isoformat()
+
+                    if "content" in entry and entry.content:
+                        content = entry.content[0].value
+                    else:
+                        content = summary
+                    
+                    # Detect language
+                    lang = detect_article_language(title, summary)
+                    
+                    try:
+                        safe_execute(
+                            """
+                            INSERT OR IGNORE INTO articles
+                            (title, summary, published, link, source, content, embedding, language, processed)
+                            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 0)
+                            """,
+                            (title, summary, published, link, url, content, lang),
+                        )
+                        articles_added += 1
+                        total_added += 1
+                    except Exception:
+                        continue
+                
+                progress_bar.progress((i + 1) / len(RSS_FEEDS))
+                
+            except Exception as e:
+                continue
+    
+    return total_added
+
 
 def detect_article_language(title: str, summary: str) -> str:
     text = f"{title} {summary}"[:500]
@@ -394,13 +290,6 @@ def filter_english_articles(df: pd.DataFrame) -> pd.DataFrame:
             lang = detect_article_language(str(row.get('title', '')), 
                                           str(row.get('summary', '')))
             if lang == 'en':
-                try:
-                    safe_execute(
-                        "UPDATE articles SET language = ? WHERE id = ?",
-                        (lang, int(row['id']))
-                    )
-                except:
-                    pass
                 english_rows.append(row)
     
     if not english_rows:
@@ -430,74 +319,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
-# ========================== RSS INGESTION ==========================
-
-def parse_rss(url: str) -> List[dict]:
-    feed = feedparser.parse(url)
-    articles = []
-    for entry in feed.entries:
-        title = entry.get("title", "")
-        summary = entry.get("summary", "")
-        link = entry.get("link", "")
-
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            pub = dt.datetime(*entry.published_parsed[:6])
-        else:
-            pub = dt.datetime.utcnow()
-        published = pub.isoformat()
-
-        if "content" in entry and entry.content:
-            content = entry.content[0].value
-        else:
-            content = summary
-
-        articles.append(
-            {
-                "title": title,
-                "summary": summary,
-                "published": published,
-                "link": link,
-                "source": url,
-                "content": content,
-            }
-        )
-    return articles
-
-
-def fetch_rss_articles() -> int:
-    new_count = 0
-    for url in RSS_FEEDS:
-        try:
-            arts = parse_rss(url)
-        except Exception:
-            continue
-        for art in arts:
-            try:
-                lang = detect_article_language(art["title"], art["summary"])
-                
-                safe_execute(
-                    """
-                    INSERT OR IGNORE INTO articles
-                    (title, summary, published, link, source, content, embedding, language)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-                    """,
-                    (
-                        art["title"],
-                        art["summary"],
-                        art["published"],
-                        art["link"],
-                        art["source"],
-                        art["content"],
-                        lang,
-                    ),
-                )
-                new_count += 1
-            except Exception:
-                pass
-    return new_count
-
-
-# ========================== HYBRID SEARCH ==========================
+# ========================== HYBRID SEARCH WITH PRECISION MODE ==========================
 
 def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     cur = conn.cursor()
@@ -506,6 +328,7 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
         SELECT id, title, summary, published, link, source, content, embedding, language
         FROM articles
         WHERE date(published) BETWEEN ? AND ?
+        AND language = 'en'
         """,
         (start.isoformat(), end.isoformat()),
     )
@@ -522,17 +345,24 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     return df
 
 
-def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
-    for _, row in df_ids_title_summary.iterrows():
-        if row["embedding"] is None:
-            text = (row["title"] or "") + " " + (row["summary"] or "")
-            if not text.strip():
-                continue
-            emb = get_embedding(text)
-            safe_execute(
-                "UPDATE articles SET embedding = ? WHERE id = ?",
-                (json.dumps(emb), int(row["id"])),
-            )
+def ensure_embeddings(df: pd.DataFrame):
+    """Generate embeddings for articles that don't have them"""
+    to_process = df[df["embedding"].isna()]
+    
+    if not to_process.empty:
+        with st.spinner(f"Generating embeddings for {len(to_process)} articles..."):
+            for _, row in to_process.iterrows():
+                text = (row["title"] or "") + " " + (row["summary"] or "")
+                if not text.strip():
+                    continue
+                try:
+                    emb = get_embedding(text)
+                    safe_execute(
+                        "UPDATE articles SET embedding = ? WHERE id = ?",
+                        (json.dumps(emb), int(row["id"])),
+                    )
+                except Exception:
+                    continue
 
 
 def hybrid_search(
@@ -540,101 +370,122 @@ def hybrid_search(
     start: dt.date,
     end: dt.date,
     top_k: int,
+    precision_mode: bool = False,  # NEW: Precision mode toggle
     min_sim: float = MIN_SIMILARITY,
 ) -> pd.DataFrame:
+    """
+    Hybrid search with PRECISION MODE option
+    - precision_mode=True: Only exact/similar matches
+    - precision_mode=False: Broader semantic search
+    """
     df = load_articles_for_range(start, end)
     if df.empty:
         return df
 
-    df["embedding"] = df["embedding"].apply(
-        lambda x: None if x in (None, "", "NULL") else x
-    )
+    # Generate missing embeddings
+    ensure_embeddings(df)
 
-    ensure_embeddings(df[["id", "title", "summary", "embedding"]])
-
+    # Reload with embeddings
     df = load_articles_for_range(start, end)
     if df.empty:
         return df
 
+    # Get query embedding
     q_emb = np.array(get_embedding(query))
+    
+    # Calculate similarities
     sims = []
     for _, row in df.iterrows():
-        emb_vec = np.array(json.loads(row["embedding"]))
-        sims.append(cosine_similarity(q_emb, emb_vec))
+        if row["embedding"] and row["embedding"] != "null":
+            try:
+                emb_vec = np.array(json.loads(row["embedding"]))
+                sim = cosine_similarity(q_emb, emb_vec)
+            except:
+                sim = 0.0
+        else:
+            sim = 0.0
+        sims.append(sim)
+    
     df["similarity"] = sims
-
-    q_lower = query.lower().strip()
-    kw_mask = (
-        df["title"].str.lower().str.contains(q_lower, na=False)
-        | df["summary"].str.lower().str.contains(q_lower, na=False)
-        | df["content"].str.lower().str.contains(q_lower, na=False)
-    )
-
-    sem_mask = df["similarity"] >= min_sim
-
-    if kw_mask.any() and sem_mask.any():
-        mask = kw_mask & sem_mask
-        df["match_type"] = np.where(
-            mask,
-            "keyword+semantic",
-            np.where(kw_mask, "keyword", "semantic"),
+    
+    # PRECISION MODE LOGIC
+    if precision_mode:
+        # STRICT FILTERING: Only high similarity OR exact keyword matches
+        q_lower = query.lower()
+        
+        # 1. High similarity articles
+        high_sim_mask = df["similarity"] >= 0.4  # Higher threshold
+        
+        # 2. Exact keyword matches
+        exact_mask = (
+            df["title"].str.lower().str.contains(q_lower, na=False) |
+            df["summary"].str.lower().str.contains(q_lower, na=False)
         )
-        filtered = df[kw_mask | sem_mask]
-    elif kw_mask.any():
-        df["match_type"] = "keyword"
-        filtered = df[kw_mask]
-    elif sem_mask.any():
-        df["match_type"] = "semantic"
-        filtered = df[sem_mask]
+        
+        # Combine: High similarity OR exact match
+        mask = high_sim_mask | exact_mask
+        
+        if mask.any():
+            filtered = df[mask].copy()
+            filtered["match_type"] = np.where(
+                exact_mask[mask], "exact", "high_similarity"
+            )
+        else:
+            return pd.DataFrame()
+    
     else:
-        return pd.DataFrame()
-
+        # NORMAL MODE: Broader semantic search (Professor's preference)
+        mask = df["similarity"] >= min_sim
+        
+        if mask.any():
+            filtered = df[mask].copy()
+            filtered["match_type"] = "semantic"
+        else:
+            return pd.DataFrame()
+    
+    # Sort and limit
     filtered = filtered.sort_values("similarity", ascending=False).head(top_k)
     return filtered
 
 
-# ========================== QUERY EXPANSION (BALANCED) ==========================
+# ========================== QUERY EXPANSION ==========================
 
-def expand_query_with_llm(query: str) -> List[str]:
+def expand_query_with_llm(query: str, enable_expansion: bool = True) -> List[str]:
     """
-    Balanced query expansion that includes negative contexts
+    Query expansion with toggle
     """
+    if not enable_expansion:
+        return [query]
+    
     client = get_openai_client()
 
     prompt = f"""
-Generate 8-12 search terms for financial news about: "{query}"
+Generate specific search terms for financial news about: "{query}"
 
-Include BOTH:
-1. Positive aspects (growth, innovation, opportunities)
-2. Negative aspects (risks, challenges, regulations, layoffs)
-3. Related industries and companies
-4. Economic and regulatory contexts
-
-For technology topics, include: chip bans, antitrust, layoffs, regulations
-For countries/regions, include: economic challenges, trade issues, policies
-
-Return ONLY a JSON list: ["term1", "term2", "term3"]
+Focus on exact terms, companies, and specific contexts.
+Return JSON list: ["term1", "term2", "term3"]
 """
 
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "Generate balanced financial news search terms."},
+                {"role": "system", "content": "Generate specific financial news search terms."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
-            max_tokens=300
+            temperature=0.3,
+            max_tokens=200
         )
         content = resp.choices[0].message.content.strip()
         
-        # Clean JSON
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
+        # Extract JSON
+        import re
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if json_match:
+            expansions = json.loads(json_match.group())
+        else:
+            expansions = json.loads(content)
         
-        expansions = json.loads(content)
         expansions = [str(t) for t in expansions if isinstance(t, str)]
         
         # Add original query
@@ -652,99 +503,93 @@ Return ONLY a JSON list: ["term1", "term2", "term3"]
             seen.add(t.lower())
             cleaned.append(t)
         
-        return cleaned[:12]
+        return cleaned[:10]
         
     except Exception:
-        # Fallback expansions
-        query_lower = query.lower()
-        if "tech" in query_lower:
-            return [
-                query,
-                "technology stocks",
-                "tech industry",
-                "tech layoffs",
-                "tech regulation",
-                "semiconductor industry",
-                "AI companies",
-                "startup funding",
-                "venture capital",
-                "antitrust technology"
-            ]
-        elif "nvidia" in query_lower:
-            return [
-                query,
-                "NVIDIA stock",
-                "GPU chips",
-                "AI hardware",
-                "chip manufacturing",
-                "AMD competition",
-                "semiconductors",
-                "chip export bans",
-                "earnings report",
-                "graphics cards"
-            ]
-        elif "germany" in query_lower:
-            return [
-                query,
-                "German economy",
-                "Germany industry",
-                "German exports",
-                "European Union",
-                "German automotive",
-                "energy crisis Germany",
-                "inflation Germany",
-                "recession Germany",
-                "manufacturing Germany"
-            ]
-        else:
-            return [query]
+        return [query]
 
 
-# ========================== ARTICLE SELECTION ==========================
+# ========================== EXTERNAL SOURCES ==========================
 
-def select_diverse_articles(df: pd.DataFrame, max_articles: int = 200) -> pd.DataFrame:
-    """
-    Select diverse articles to avoid bias
-    """
-    if df.empty or len(df) <= max_articles:
-        return df
+def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
+    """Fetch from GDELT for more articles"""
+    new_count = 0
     
-    # Sort by relevance
-    df_sorted = df.sort_values("similarity", ascending=False).copy()
+    start_str = start.strftime("%Y%m%d000000")
+    end_str = end.strftime("%Y%m%d235959")
     
-    # Take top 60% by relevance
-    top_count = int(max_articles * 0.6)
-    selected = df_sorted.head(top_count).copy()
+    base_url = (
+        "https://api.gdeltproject.org/api/v2/doc/doc"
+        f"?query={requests.utils.quote(query)}"
+        f"&mode=artlist&maxrecords={GDELT_MAX_RECORDS}&format=json"
+        f"&startdatetime={start_str}&enddatetime={end_str}"
+    )
     
-    # Add 40% from diverse sources and dates
-    remaining = df_sorted.iloc[top_count:].copy()
+    try:
+        r = requests.get(base_url, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            articles = data.get("articles", [])
+            
+            for a in articles[:50]:  # Limit to 50
+                title = a.get("title", "")
+                summary = a.get("seendate", "")
+                link = a.get("url", "")
+                src = a.get("domain", "gdelt")
+                
+                try:
+                    safe_execute(
+                        """
+                        INSERT OR IGNORE INTO articles
+                        (title, summary, published, link, source, content, embedding, language, processed)
+                        VALUES (?, ?, ?, ?, ?, ?, NULL, 'en', 0)
+                        """,
+                        (title, summary, dt.datetime.utcnow().isoformat(), link, src, title + " " + summary),
+                    )
+                    new_count += 1
+                except:
+                    continue
+    except:
+        pass
     
-    # Add by source diversity
-    sources_in_selected = selected["source"].unique()
-    for source in remaining["source"].unique():
-        if source not in sources_in_selected:
-            source_articles = remaining[remaining["source"] == source]
-            if not source_articles.empty:
-                selected = pd.concat([selected, source_articles.head(1)], ignore_index=True)
-    
-    # Add by date diversity
-    if len(selected) < max_articles:
-        remaining = df_sorted[~df_sorted["id"].isin(selected["id"])]
-        if not remaining.empty:
-            remaining["published_date"] = pd.to_datetime(remaining["published"]).dt.date
-            date_groups = remaining.groupby("published_date")
-            for date, group in date_groups:
-                if len(selected) < max_articles and not group.empty:
-                    selected = pd.concat([selected, group.head(1)], ignore_index=True)
-    
-    # Final trim if needed
-    if len(selected) > max_articles:
-        selected = selected.head(max_articles)
-    
-    return selected
+    return new_count
 
 
-# ========================== SENTIMENT CALCULATION ==========================
+def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
+    """Fetch from Google News"""
+    new_count = 0
+    
+    try:
+        gn = GNews(language="en", max_results=GNEWS_MAX_RESULTS)
+        gn.start_date = (start.year, start.month, start.day)
+        gn.end_date = (end.year, end.month, end.day)
+        results = gn.get_news(query)
+        
+        for r in results[:50]:  # Limit to 50
+            title = r.get("title", "")
+            link = r.get("url") or r.get("link", "")
+            desc = r.get("description", "")
+            source = r.get("publisher", {}).get("title", "google-news")
+            
+            try:
+                safe_execute(
+                    """
+                    INSERT OR IGNORE INTO articles
+                    (title, summary, published, link, source, content, embedding, language, processed)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, 'en', 0)
+                    """,
+                    (title, desc, dt.datetime.utcnow().isoformat(), link, source, title + " " + desc),
+                )
+                new_count += 1
+            except:
+                continue
+    except:
+        pass
+    
+    return new_count
+
+
+# ========================== UTILITY FUNCTIONS ==========================
 
 def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]]:
     text = " ".join(titles).lower()
@@ -790,48 +635,97 @@ def run_app():
     # Title
     st.title("📈 Financial News Sentiment Dashboard")
     st.markdown(
-        "RSS Feeds → **Semantic Search + Query Expansion** → Balanced Sentiment Analysis"
+        "**25+ RSS Feeds → Smart Search → Balanced Sentiment Analysis**"
     )
 
     # SIDEBAR
     with st.sidebar:
-        st.header("Settings")
-
-        if st.button("Fetch Latest RSS Articles"):
-            with st.spinner("Fetching RSS feeds…"):
-                n = fetch_rss_articles()
-            st.success(f"Added {n} new articles")
-
+        st.header("📊 Database Management")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Fetch ALL RSS Feeds", type="primary"):
+                total = fetch_all_rss_feeds()
+                st.success(f"✅ Added {total} new articles!")
+        
+        with col2:
+            if st.button("🗑️ Clear Database"):
+                conn.execute("DELETE FROM articles")
+                conn.commit()
+                st.success("Database cleared!")
+        
+        # Show database stats
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM articles")
+        total_articles = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM articles WHERE embedding IS NOT NULL")
+        embedded_articles = cur.fetchone()[0]
+        
+        st.metric("📂 Total Articles", f"{total_articles:,}")
+        st.metric("🧠 With Embeddings", f"{embedded_articles:,}")
+        
+        st.markdown("---")
+        st.header("🔍 Search Settings")
+        
         today = dt.date.today()
-        default_start = today - dt.timedelta(days=30)
+        default_start = today - dt.timedelta(days=90)  # 3 months for more articles
         start_date = st.date_input("Start date", default_start)
         end_date = st.date_input("End date", today)
         
-        st.subheader("Analysis Options")
-        use_query_expansion = st.checkbox("Use Query Expansion", True,
-                                         help="Expand search terms for better coverage")
+        st.subheader("Search Mode")
+        search_mode = st.radio(
+            "Select search mode:",
+            ["🔍 Precision Mode (Exact matches)", "🌐 Broad Mode (Semantic + Related)"],
+            index=1,
+            help="Precision: Only exact/similar articles | Broad: Includes related articles"
+        )
+        
+        precision_mode = (search_mode == "🔍 Precision Mode (Exact matches)")
+        
+        st.subheader("Additional Sources")
+        use_gdelt = st.checkbox("Include GDELT", True)
+        use_gnews = st.checkbox("Include Google News", True)
+        use_query_expansion = st.checkbox("Use Query Expansion", True)
         filter_english = st.checkbox("Filter English articles only", True)
         
         max_articles = st.slider(
-            "Maximum articles to analyze",
-            min_value=50,
-            max_value=500,
-            value=MAX_ARTICLES_DEFAULT,
-            step=50,
+            "Maximum articles",
+            min_value=100,
+            max_value=1000,
+            value=500,
+            step=100,
         )
 
     # MAIN QUERY
     st.markdown("### 🔍 Search Topic")
     query = st.text_input(
-        "Enter topic (e.g. 'US Tech', 'Germany', 'Nvidia', 'European textiles')",
+        "Enter topic (e.g. 'Germany', 'US Tech', 'Nvidia', 'Oil Prices')",
         key="main_query",
         placeholder="Type your topic here..."
     )
 
-    analyze_clicked = st.button("Analyze", type="primary")
+    analyze_clicked = st.button("🚀 Analyze", type="primary")
 
     if not analyze_clicked:
         st.info("Enter a topic and click **Analyze** to run the analysis.")
+        
+        # Show recent articles
+        st.markdown("### 📰 Recent Articles in Database")
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT title, source, published 
+            FROM articles 
+            WHERE language = 'en'
+            ORDER BY published DESC 
+            LIMIT 10
+        """)
+        recent = cur.fetchall()
+        
+        for title, source, published in recent:
+            st.caption(f"**{title}**")
+            st.caption(f"📰 {source} | 📅 {published[:10]}")
+            st.markdown("---")
+        
         return
 
     if not query.strip():
@@ -839,66 +733,86 @@ def run_app():
         return
 
     # QUERY EXPANSION
-    if use_query_expansion:
-        with st.spinner("Expanding search terms for better coverage…"):
-            expanded_queries = expand_query_with_llm(query)
+    if use_query_expansion and not precision_mode:
+        with st.spinner("Expanding search terms..."):
+            expanded_queries = expand_query_with_llm(query, use_query_expansion)
         
         st.write("**Expanded search terms:**")
         st.write(", ".join(expanded_queries[:8]) + ("..." if len(expanded_queries) > 8 else ""))
+        search_queries = expanded_queries
     else:
-        expanded_queries = [query]
-        st.info("Using original query only (no expansion)")
+        search_queries = [query]
+        st.info(f"Using exact query: **{query}**")
+
+    # EXTERNAL SOURCES
+    external_added = 0
+    if use_gdelt or use_gnews:
+        with st.spinner("Fetching from external sources..."):
+            for q in search_queries[:3]:
+                if use_gdelt:
+                    external_added += fetch_gdelt_articles(q, start_date, end_date)
+                if use_gnews:
+                    external_added += fetch_gnews_articles(q, start_date, end_date)
+        
+        if external_added > 0:
+            st.success(f"Added {external_added} articles from external sources")
 
     # HYBRID SEARCH
-    with st.spinner("Searching for relevant articles…"):
+    with st.spinner(f"Searching {len(search_queries)} queries..."):
         dfs = []
-        for q in expanded_queries:
+        total_found = 0
+        
+        for q in search_queries:
             part = hybrid_search(
                 query=q,
                 start=start_date,
                 end=end_date,
                 top_k=max_articles,
-                min_sim=MIN_SIMILARITY,
+                precision_mode=precision_mode,
+                min_sim=0.4 if precision_mode else MIN_SIMILARITY
             )
+            
             if not part.empty:
                 part["query_term"] = q
                 dfs.append(part)
-
+                total_found += len(part)
+        
         if not dfs:
-            st.error(
-                "No articles found for this topic in the selected date range. "
-                "Try broadening the date range or using different search terms."
-            )
+            st.error(f"No articles found for '{query}'. Try:")
+            st.info("1. Broaden date range (currently {start_date} to {end_date})")
+            st.info("2. Use 'Broad Mode' instead of 'Precision Mode'")
+            st.info("3. Click 'Fetch ALL RSS Feeds' to add more articles")
             return
 
         df = pd.concat(dfs, ignore_index=True)
         df = df.drop_duplicates(subset=["link"])
 
-    st.write(f"🔎 Found **{len(df)}** relevant articles.")
+    st.success(f"🔎 Found **{len(df):,}** relevant articles.")
 
-    # FILTER ENGLISH ARTICLES
+    # FILTER ENGLISH
     if filter_english:
-        with st.spinner("Filtering English articles…"):
+        with st.spinner("Filtering English articles..."):
             df_before = len(df)
             df = filter_english_articles(df)
             df_after = len(df)
             if df_after < df_before:
                 st.info(f"Filtered out {df_before - df_after} non-English articles.")
 
-    # SELECT DIVERSE ARTICLES
-    with st.spinner("Selecting diverse articles for analysis…"):
-        df = select_diverse_articles(df, max_articles)
-    
+    # LIMIT ARTICLES
+    if len(df) > max_articles:
+        df = df.head(max_articles)
+        st.info(f"Limited to {max_articles} articles for analysis")
+
     if df.empty:
         st.error("No articles remained after filtering.")
         return
 
-    st.success(f"✅ Selected **{len(df)}** articles for sentiment analysis.")
+    st.success(f"✅ Analyzing **{len(df)}** articles")
 
-    # SENTIMENT ANALYSIS (MAIN FIX)
-    with st.spinner(f"Analyzing sentiment for {len(df)} articles…"):
+    # SENTIMENT ANALYSIS
+    with st.spinner(f"Analyzing sentiment..."):
         texts = df["content"].fillna(df["summary"]).tolist()
-        sents = balanced_sentiment_analysis(texts)
+        sents = finbert_sentiment(texts)
         df["sentiment_label"] = [s["label"] for s in sents]
         df["sentiment_score"] = [s["score"] for s in sents]
     
@@ -907,7 +821,7 @@ def run_app():
         lambda x: x.split("//")[-1].split("/")[0] if "//" in str(x) else str(x)
     )
 
-    # CALCULATE SENTIMENT METRICS
+    # CALCULATE METRICS
     sentiment_index = calculate_sentiment_index(df)
     
     counts = df["sentiment_label"].value_counts()
@@ -926,12 +840,16 @@ def run_app():
     # DASHBOARD TAB
     with tab_dash:
         st.subheader("Executive Sentiment Overview")
+        
+        # Show search mode info
+        mode_info = "🔍 **Precision Mode**: Showing exact/similar matches" if precision_mode else "🌐 **Broad Mode**: Including related articles"
+        st.info(mode_info)
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Total Articles", total)
-        c2.metric("Positive", pos, f"{(pos/total*100):.1f}%" if total else "0.0%")
-        c3.metric("Negative", neg, f"{(neg/total*100):.1f}%" if total else "0.0%")
-        c4.metric("Neutral", neu, f"{(neu/total*100):.1f}%" if total else "0.0%")
+        c1.metric("Total Articles", f"{total:,}")
+        c2.metric("Positive", f"{pos:,}", f"{(pos/total*100):.1f}%" if total else "0.0%")
+        c3.metric("Negative", f"{neg:,}", f"{(neg/total*100):.1f}%" if total else "0.0%")
+        c4.metric("Neutral", f"{neu:,}", f"{(neu/total*100):.1f}%" if total else "0.0%")
         
         direction = "Bullish" if sentiment_index > 0 else "Bearish" if sentiment_index < 0 else "Neutral"
         c5.metric("Sentiment Index", f"{sentiment_index:.1f}", direction)
@@ -959,48 +877,26 @@ def run_app():
             st.plotly_chart(fig_pie, use_container_width=True)
         
         with col2:
-            st.markdown("#### Sentiment Index Gauge")
-            gauge_color = "#2ecc71" if sentiment_index > 0 else "#e74c3c"
-            fig_g = go.Figure(
-                go.Indicator(
-                    mode="gauge+number+delta",
-                    value=sentiment_index,
-                    title={"text": "Sentiment Index"},
-                    delta={"reference": 0},
-                    gauge={
-                        "axis": {"range": [-100, 100]},
-                        "bar": {"color": gauge_color},
-                        "steps": [
-                            {"range": [-100, 0], "color": "rgba(231, 76, 60, 0.2)"},
-                            {"range": [0, 100], "color": "rgba(46, 204, 113, 0.2)"},
-                        ],
-                        "threshold": {
-                            "line": {"color": "red", "width": 4},
-                            "thickness": 0.75,
-                            "value": 0,
-                        },
-                    },
-                )
+            st.markdown("#### Articles by Source")
+            src_counts = df["source_domain"].value_counts().head(15)
+            fig_src = px.bar(
+                x=src_counts.values,
+                y=src_counts.index,
+                orientation="h",
+                labels={"x": "Count", "y": "Source"},
+                color=src_counts.values,
+                color_continuous_scale="Viridis",
             )
-            fig_g.update_layout(height=400)
-            st.plotly_chart(fig_g, use_container_width=True)
-        
-        # SOURCE DISTRIBUTION
-        st.markdown("#### Articles by Source")
-        src_counts = df["source_domain"].value_counts().head(10)
-        fig_src = px.bar(
-            x=src_counts.values,
-            y=src_counts.index,
-            orientation="h",
-            labels={"x": "Count", "y": "Source"},
-            color=src_counts.values,
-            color_continuous_scale="Viridis",
-        )
-        st.plotly_chart(fig_src, use_container_width=True)
+            st.plotly_chart(fig_src, use_container_width=True)
 
     # ARTICLES TAB
     with tab_articles:
-        st.subheader("Articles")
+        st.subheader(f"📰 Articles ({len(df)} total)")
+        
+        # Show match type distribution
+        if "match_type" in df.columns:
+            match_counts = df["match_type"].value_counts()
+            st.caption(f"Match types: {', '.join([f'{k}: {v}' for k, v in match_counts.items()])}")
         
         sent_filter = st.multiselect(
             "Filter by sentiment",
@@ -1013,20 +909,28 @@ def run_app():
         
         for _, row in filtered.iterrows():
             icon = {"positive": "🟢", "negative": "🔴", "neutral": "🔵"}[row["sentiment_label"]]
-            st.markdown(f"**{icon} {row['title']}**")
+            
+            # Show match type badge
+            match_badge = ""
+            if "match_type" in row and row["match_type"] == "exact":
+                match_badge = "🎯 "
+            elif "match_type" in row and row["match_type"] == "high_similarity":
+                match_badge = "⚡ "
+            
+            st.markdown(f"**{match_badge}{icon} {row['title']}**")
             c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-            c1.caption(row["source_domain"])
-            c2.caption(f"Relevance: {row['relevance']:.1f}%")
-            c3.caption(f"Sentiment: {row['sentiment_label']} ({row['sentiment_score']*100:.1f}%)")
+            c1.caption(f"📰 {row['source_domain']}")
+            c2.caption(f"🎯 Relevance: {row['relevance']:.1f}%")
+            c3.caption(f"😊 {row['sentiment_label']} ({row['sentiment_score']*100:.1f}%)")
             c4.markdown(f"[Read →]({row['link']})")
             if row["summary"]:
-                st.caption(row["summary"][:280] + "…")
+                st.caption(row["summary"][:300] + "…")
             st.markdown("---")
 
     # KEYWORDS TAB
     with tab_keywords:
         st.subheader("Trending Keywords")
-        keywords = extract_top_keywords(df["title"].tolist(), n=20)
+        keywords = extract_top_keywords(df["title"].tolist(), n=25)
         if keywords:
             kw_df = pd.DataFrame(keywords, columns=["Keyword", "Frequency"])
             fig_kw = px.bar(
@@ -1055,16 +959,15 @@ def run_app():
                 "sentiment_label",
                 "sentiment_score",
                 "relevance",
-                "match_type",
+                "match_type" if "match_type" in df.columns else "",
                 "query_term",
-                "language",
             ]
         ]
         csv = dl_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "📥 Download CSV",
             csv,
-            file_name="news_sentiment_results.csv",
+            file_name=f"news_sentiment_{query.replace(' ', '_')}.csv",
             mime="text/csv",
         )
         st.write("### Data Preview")
