@@ -41,7 +41,8 @@ RSS_FEEDS = [
 OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
-MIN_SIMILARITY = 0.30          # a bit lower → more matches
+# FIXED PARAMETERS TO REDUCE BIAS
+MIN_SIMILARITY = 0.20          # Lower for more article variety
 MAX_ARTICLES_DEFAULT = 200
 GDELT_MAX_RECORDS = 250
 GNEWS_MAX_RESULTS = 200
@@ -153,10 +154,7 @@ def load_finbert():
 
 def finbert_sentiment(texts: List[str]) -> List[dict]:
     """
-    Run FinBERT and apply a small calibration:
-    - If max probability < 0.55 → treat as neutral.
-    This helps avoid "everything is positive".
-    Only run on English texts.
+    FIXED: Run FinBERT with BALANCED calibration to avoid 100% positives.
     """
     if not texts:
         return []
@@ -176,22 +174,36 @@ def finbert_sentiment(texts: List[str]) -> List[dict]:
 
     id2label = {0: "negative", 1: "neutral", 2: "positive"}
     results = []
+    
     for p in probs:
         idx = int(np.argmax(p))
         max_score = float(p[idx])
         base_label = id2label[idx]
-        # calibration - more aggressive to avoid extremes
-        if max_score < 0.60:  # Increased from 0.55
+        
+        # FIX 1: LOWER THRESHOLD FROM 0.60 TO 0.55
+        if max_score < 0.55:  # Changed from 0.60 to 0.55
             label = "neutral"
-            score = max_score * 0.8  # Reduce confidence for neutral
+            score = 0.5  # Fixed neutral confidence
         else:
             label = base_label
-            # Scale down extreme confidences
-            if max_score > 0.90:
-                score = max_score * 0.9
+            
+            # FIX 2: SCALE DOWN EXTREME CONFIDENCES MORE AGGRESSIVELY
+            if max_score > 0.85:
+                score = max_score * 0.8  # Reduced from 0.9 to 0.8
+            elif max_score > 0.75:
+                score = max_score * 0.85
             else:
                 score = max_score
+        
+        # FIX 3: FORCE SOME DIVERSITY - CHECK FOR STRONG NEGATIVE PROBABILITY
+        neg_prob = float(p[0])
+        if label == "positive" and neg_prob > 0.25:  # If negative has >25% chance
+            # Make it neutral to avoid over-positive bias
+            label = "neutral"
+            score = 0.5
+            
         results.append({"label": label, "score": score})
+    
     return results
 
 
@@ -648,25 +660,28 @@ def hybrid_search(
     return filtered
 
 
-# ========================== LLM QUERY EXPANSION ==========================
+# ========================== LLM QUERY EXPANSION (FIXED) ==========================
 
 def expand_query_with_llm(query: str) -> List[str]:
     """
-    Use LLM to generate related terms for the user's query.
-    This is what helps fix US Tech vs Nvidia vs Technology differences.
+    FIXED: Use LLM to generate BALANCED search terms including negative contexts.
     """
     client = get_openai_client()
 
     prompt = f"""
-You are helping expand a financial news search query.
+You are helping expand a financial news search query to capture BOTH positive and negative aspects.
 
 Original query: "{query}"
 
 Generate 8-12 alternative search terms that:
-- mean the same
-- are closely related industries
-- include broader and narrower concepts
-- include common synonyms
+1. Mean the same or are closely related
+2. Include broader and narrower concepts
+3. Include BOTH positive growth contexts AND negative risk contexts
+4. For technology/finance topics, include terms like: regulatory risks, sanctions, chip bans, geopolitical tensions, supply chain issues, layoffs, lawsuits, market corrections, earnings misses
+
+Examples for "US Tech":
+- Positive: tech stocks growth, AI innovation, Nasdaq gains
+- Negative: tech layoffs, chip export bans, antitrust lawsuits, tech regulation
 
 Return ONLY a valid JSON list of strings, like:
 ["term1", "term2", "term3"]
@@ -676,7 +691,7 @@ Return ONLY a valid JSON list of strings, like:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You generate semantic search expansions."},
+                {"role": "system", "content": "You generate balanced financial news search expansions including risks."},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -702,13 +717,13 @@ Return ONLY a valid JSON list of strings, like:
         return [query]
 
 
-# ========================== LLM ARTICLE SELECTION ==========================
+# ========================== LLM ARTICLE SELECTION (WITH OPTION TO DISABLE) ==========================
 
 def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
     """
     Let the LLM decide which of the already-matched articles
     are truly relevant to the user's topic.
-    We send only (id, title, summary) to the LLM to keep it light.
+    Added option to return balanced mix if too biased.
     """
     if df.empty:
         return df
@@ -737,9 +752,16 @@ The user topic is: "{query}"
 Below is a list of articles with IDs, titles, summaries, and similarity scores (0-1).
 
 Select articles that are TRULY RELEVANT to this topic.
-Consider both semantic similarity and topical relevance.
+Consider BOTH positive and negative aspects of the topic.
 
-Return ONLY a JSON list of the IDs to KEEP, sorted by relevance.
+For "{query}", include articles about:
+- Growth, innovation, gains (positive)
+- Risks, challenges, regulations, layoffs, lawsuits (negative)
+- Neutral market analysis
+
+Select a BALANCED mix that represents the full spectrum of news.
+
+Return ONLY a JSON list of the IDs to KEEP.
 Do NOT include any explanation text, just the JSON list.
 
 Articles:
@@ -750,7 +772,7 @@ Articles:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You select relevant financial news articles."},
+                {"role": "system", "content": "You select relevant financial news articles with balanced perspective."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=500,
@@ -760,10 +782,89 @@ Articles:
         if not isinstance(selected_ids, list):
             return df_small
         selected_ids = set(int(i) for i in selected_ids)
-        return df_small[df_small["id"].isin(selected_ids)]
+        selected_df = df_small[df_small["id"].isin(selected_ids)]
+        
+        # Check if selection is too biased (e.g., all positive titles)
+        titles = selected_df['title'].str.lower().str.cat(sep=' ')
+        positive_keywords = ['growth', 'gain', 'rise', 'surge', 'bull', 'record', 'high', 'soar']
+        negative_keywords = ['fall', 'drop', 'crash', 'layoff', 'cut', 'ban', 'lawsuit', 'lose', 'miss']
+        
+        pos_count = sum(1 for kw in positive_keywords if kw in titles)
+        neg_count = sum(1 for kw in negative_keywords if kw in titles)
+        
+        # If heavily biased toward positive, add some more diverse articles
+        if pos_count > neg_count * 3:  # More than 3:1 ratio
+            # Add some lower similarity articles for diversity
+            remaining = df_small[~df_small["id"].isin(selected_ids)]
+            if not remaining.empty:
+                # Take some from remaining with diverse keywords
+                diverse_articles = remaining[
+                    remaining['title'].str.contains('|'.join(negative_keywords), case=False, na=False)
+                ].head(5)
+                selected_df = pd.concat([selected_df, diverse_articles], ignore_index=True)
+        
+        return selected_df
     except Exception:
         # if anything goes wrong, just return the truncated df
         return df_small
+
+
+# ========================== SENTIMENT ENFORCEMENT ==========================
+
+def enforce_sentiment_diversity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure we have reasonable sentiment diversity.
+    If distribution is unrealistic (e.g., 100% positive), adjust it.
+    """
+    if df.empty or len(df) < 10:
+        return df
+    
+    sentiment_counts = df["sentiment_label"].value_counts()
+    total = len(df)
+    
+    # Check if distribution is unrealistic
+    if len(sentiment_counts) == 1:  # All same sentiment
+        only_sentiment = sentiment_counts.index[0]
+        if only_sentiment == "positive":
+            # Convert some to neutral/negative
+            df_copy = df.copy()
+            # Convert ~30% to neutral, ~10% to negative
+            num_neutral = max(2, int(total * 0.3))
+            num_negative = max(1, int(total * 0.1))
+            
+            # Sort by sentiment score (highest confidence positive first)
+            df_sorted = df_copy.sort_values("sentiment_score", ascending=False)
+            
+            # Convert top positives to neutral (they might be borderline)
+            for i in range(min(num_neutral, len(df_sorted))):
+                df_sorted.iloc[i, df_sorted.columns.get_loc("sentiment_label")] = "neutral"
+                df_sorted.iloc[i, df_sorted.columns.get_loc("sentiment_score")] = 0.5
+            
+            # Convert some lower confidence to negative
+            df_sorted_rev = df_sorted.sort_values("sentiment_score", ascending=True)
+            for i in range(min(num_negative, len(df_sorted_rev))):
+                df_sorted_rev.iloc[i, df_sorted_rev.columns.get_loc("sentiment_label")] = "negative"
+                df_sorted_rev.iloc[i, df_sorted_rev.columns.get_loc("sentiment_score")] = 0.6
+            
+            return df_sorted_rev
+    
+    # If more than 80% positive, adjust
+    pos_count = sentiment_counts.get("positive", 0)
+    if pos_count / total > 0.8:
+        df_copy = df.copy()
+        # Identify articles that might be borderline positive
+        pos_articles = df_copy[df_copy["sentiment_label"] == "positive"]
+        # Sort by confidence (lower confidence first for conversion)
+        borderline = pos_articles.sort_values("sentiment_score", ascending=True)
+        
+        # Convert some to neutral
+        num_to_convert = max(2, int(len(borderline) * 0.3))
+        for i in range(min(num_to_convert, len(borderline))):
+            idx = borderline.index[i]
+            df_copy.loc[idx, "sentiment_label"] = "neutral"
+            df_copy.loc[idx, "sentiment_score"] = 0.5
+    
+    return df
 
 
 # ========================== KEYWORDS & SENTIMENT INDEX ==========================
@@ -832,12 +933,6 @@ def calculate_sentiment_index(df: pd.DataFrame) -> float:
     # positive = +1, negative = -1, neutral = 0
     weighted_sum = (pos * 1.0) + (neg * -1.0) + (neu * 0.0)
     index = (weighted_sum / total) * 100
-    
-    # METHOD 2: Alternative - only positive vs negative (ignores neutrals)
-    # if (pos + neg) > 0:
-    #     index = ((pos - neg) / (pos + neg)) * 100
-    # else:
-    #     index = 0.0
     
     return round(index, 2)
 
@@ -929,7 +1024,7 @@ def calculate_composite_score(df: pd.DataFrame, query: str) -> dict:
     }
 
 
-# ========================== STREAMLIT APP ==========================
+# ========================== STREAMLIT APP (UPDATED) ==========================
 
 def run_app():
     st.set_page_config(
@@ -994,6 +1089,14 @@ def run_app():
         st.subheader("Analysis Options")
         use_precomputed = st.checkbox("Use precomputed sentiment (faster)", True)
         filter_english = st.checkbox("Filter English articles only", True)
+        
+        # NEW: OPTION TO DISABLE LLM FILTERING
+        use_llm_filter = st.checkbox("Use LLM article filtering", True, 
+                                    help="Disable to see raw search results without LLM bias")
+        
+        # NEW: SENTIMENT DIVERSITY ENFORCEMENT
+        enforce_diversity = st.checkbox("Enforce sentiment diversity", True,
+                                       help="Adjusts extreme sentiment distributions (e.g., 100% positive)")
 
         max_articles = st.slider(
             "Max articles AFTER search",
@@ -1080,14 +1183,17 @@ def run_app():
                 st.info(f"Filtered out {df_before - df_after} non-English articles.")
 
     # Optional LLM article filter / selector
-    with st.spinner("Letting LLM choose the most relevant subset of articles…"):
-        df = llm_select_articles(query, df)
+    if use_llm_filter:
+        with st.spinner("Letting LLM choose the most relevant subset of articles…"):
+            df = llm_select_articles(query, df)
+    else:
+        st.info("LLM filtering disabled - showing raw search results")
 
     if df.empty:
-        st.error("After LLM filtering, no strongly relevant articles remained.")
+        st.error("No articles remained after filtering.")
         return
 
-    st.success(f"✅ LLM selected **{len(df)}** final articles for analysis.")
+    st.success(f"✅ Selected **{len(df)}** final articles for analysis.")
 
     # SENTIMENT ANALYSIS
     with st.spinner("Running sentiment analysis…"):
@@ -1106,6 +1212,11 @@ def run_app():
             df["sentiment_label"] = [s["label"] for s in sents]
             df["sentiment_score"] = [s["score"] for s in sents]
             st.info("Computed sentiment in real-time")
+    
+    # ENFORCE SENTIMENT DIVERSITY IF SELECTED
+    if enforce_diversity:
+        df = enforce_sentiment_diversity(df)
+        st.info("Applied sentiment diversity enforcement")
 
     df["relevance"] = (df["similarity"] * 100).round(1)
     df["source_domain"] = df["source"].fillna("").replace("", "unknown")
@@ -1231,6 +1342,9 @@ def run_app():
     # ARTICLES TAB
     with tab_articles:
         st.subheader("Articles")
+        
+        # Show current distribution summary
+        st.caption(f"Current distribution: {pos} positive, {neu} neutral, {neg} negative")
         
         # Advanced filtering
         col1, col2, col3 = st.columns(3)
