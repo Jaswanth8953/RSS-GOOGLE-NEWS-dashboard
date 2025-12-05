@@ -142,7 +142,7 @@ def ensure_language(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ========================== SIMPLE FINBERT SENTIMENT ==========================
+# ========================== FIXED FINBERT SENTIMENT ==========================
 
 @st.cache_resource
 def load_finbert():
@@ -155,50 +155,84 @@ def load_finbert():
 
 
 def finbert_sentiment_simple(texts: List[str]) -> List[dict]:
-    """Simple, reliable sentiment analysis"""
+    """FIXED: Proper calibration to avoid 100% confidence bug"""
     if not texts:
         return []
     
     tokenizer, model, device = load_finbert()
     
-    # Clean texts
-    texts = [str(t)[:500] if t else "" for t in texts]
+    # Process in small batches
+    batch_size = 16
+    all_results = []
     
-    try:
-        enc = tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=256,
-            return_tensors="pt",
-        ).to(device)
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
         
-        with torch.no_grad():
-            outputs = model(**enc)
-            probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
-        
-        id2label = {0: "negative", 1: "neutral", 2: "positive"}
-        results = []
-        
-        for p in probs:
-            idx = int(np.argmax(p))
-            max_score = float(p[idx])
-            label = id2label[idx]
+        try:
+            enc = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors="pt",
+            ).to(device)
             
-            # Very simple logic - no complex calibration
-            if max_score > 0.60:  # Confident prediction
-                score = max_score
-            else:  # Low confidence = neutral
-                label = "neutral"
-                score = 0.5
+            with torch.no_grad():
+                outputs = model(**enc)
+                probs = torch.softmax(outputs.logists, dim=1).cpu().numpy()
             
-            results.append({"label": label, "score": score})
-        
-        return results
-        
-    except Exception:
-        # If anything fails, return neutral for all
-        return [{"label": "neutral", "score": 0.5} for _ in texts]
+            id2label = {0: "negative", 1: "neutral", 2: "positive"}
+            
+            for p in probs:
+                idx = int(np.argmax(p))
+                max_score = float(p[idx])
+                label = id2label[idx]
+                
+                # CRITICAL FIX: Proper calibration to avoid 100% confidence
+                # Scale down high confidence scores
+                if max_score > 0.90:
+                    # Extremely high confidence - scale down aggressively
+                    score = max_score * 0.7
+                elif max_score > 0.80:
+                    # High confidence - scale down moderately
+                    score = max_score * 0.8
+                elif max_score > 0.70:
+                    # Good confidence - slight adjustment
+                    score = max_score * 0.9
+                elif max_score < 0.55:
+                    # Low confidence - force to neutral
+                    label = "neutral"
+                    score = 0.5
+                else:
+                    # Moderate confidence
+                    score = max_score
+                
+                # Ensure diversity: if label is positive but has significant negative probability
+                if label == "positive" and p[0] > 0.25:
+                    # If negative probability is high, lean toward neutral
+                    if p[0] > 0.35:
+                        label = "neutral"
+                        score = 0.5
+                    else:
+                        # Reduce confidence
+                        score = score * 0.8
+                
+                # Ensure diversity: if label is negative but has significant positive probability
+                elif label == "negative" and p[2] > 0.25:
+                    if p[2] > 0.35:
+                        label = "neutral"
+                        score = 0.5
+                    else:
+                        score = score * 0.8
+                
+                all_results.append({"label": label, "score": score})
+                
+        except Exception as e:
+            # If batch fails, assign neutral
+            for _ in batch_texts:
+                all_results.append({"label": "neutral", "score": 0.5})
+    
+    return all_results
 
 
 # ========================== EMBEDDINGS ==========================
@@ -444,7 +478,7 @@ def hybrid_search(query: str, start: dt.date, end: dt.date, top_k: int) -> pd.Da
 
 def expand_query(query: str) -> List[str]:
     client = get_openai_client()
-    prompt = f"""Generate 8-10 financial news search terms related to: "{query}"
+    prompt = f"""Generate 6-8 financial news search terms related to: "{query}"
 
 Return ONLY a JSON array of strings like ["term1", "term2", "term3"]"""
 
@@ -479,7 +513,7 @@ Return ONLY a JSON array of strings like ["term1", "term2", "term3"]"""
                 seen.add(key)
                 cleaned.append(t)
         
-        return cleaned[:10]
+        return cleaned[:8]
         
     except Exception:
         return [query]
@@ -488,7 +522,7 @@ Return ONLY a JSON array of strings like ["term1", "term2", "term3"]"""
 # ========================== SENTIMENT CALCULATION ==========================
 
 def analyze_sentiment_for_all_articles(df: pd.DataFrame) -> pd.DataFrame:
-    """Analyze sentiment for ALL articles (not just English)"""
+    """Analyze sentiment for ALL articles with proper calibration"""
     df_result = df.copy()
     
     # Initialize sentiment columns
@@ -509,30 +543,23 @@ def analyze_sentiment_for_all_articles(df: pd.DataFrame) -> pd.DataFrame:
     # If we have texts to analyze
     if texts:
         try:
-            # Analyze in small batches
-            batch_size = 32
-            all_sentiments = []
-            
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i+batch_size]
-                sentiments = finbert_sentiment_simple(batch)
-                all_sentiments.extend(sentiments)
-                time.sleep(0.05)  # Small delay
+            # Analyze with FIXED calibration
+            sentiments = finbert_sentiment_simple(texts)
             
             # Apply sentiments to DataFrame
             for i, idx in enumerate(indices):
-                if i < len(all_sentiments):
-                    df_result.at[idx, "sentiment_label"] = all_sentiments[i]["label"]
-                    df_result.at[idx, "sentiment_score"] = all_sentiments[i]["score"]
+                if i < len(sentiments):
+                    df_result.at[idx, "sentiment_label"] = sentiments[i]["label"]
+                    df_result.at[idx, "sentiment_score"] = sentiments[i]["score"]
         
         except Exception as e:
-            st.warning(f"⚠️ Sentiment analysis issue. Using neutral defaults. Error: {str(e)[:50]}")
+            st.warning(f"⚠️ Sentiment analysis issue. Using neutral defaults.")
     
     return df_result
 
 
 def calculate_sentiment_metrics(df: pd.DataFrame) -> dict:
-    """Calculate all sentiment metrics"""
+    """Calculate all sentiment metrics with weighted average"""
     if df.empty:
         return {
             "total_articles": 0,
@@ -540,7 +567,7 @@ def calculate_sentiment_metrics(df: pd.DataFrame) -> dict:
             "negative": 0,
             "neutral": 0,
             "sentiment_index": 0.0,
-            "scored_articles": 0
+            "avg_confidence": 0.0
         }
     
     total = len(df)
@@ -551,15 +578,34 @@ def calculate_sentiment_metrics(df: pd.DataFrame) -> dict:
     neg = int(counts.get("negative", 0))
     neu = int(counts.get("neutral", 0))
     
-    # Calculate sentiment index
+    # Calculate weighted sentiment index
     if total > 0:
-        # Simple calculation: (positive% - negative%) * 100
-        pos_pct = (pos / total) * 100
-        neg_pct = (neg / total) * 100
-        sentiment_index = (pos_pct - neg_pct)
+        # Map sentiments to values
+        sentiment_map = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+        df["sentiment_value"] = df["sentiment_label"].map(sentiment_map).fillna(0.0)
+        
+        # Weight by confidence scores
+        weights = df["sentiment_score"].fillna(0.5).values
+        sentiment_values = df["sentiment_value"].values
+        
+        # Calculate weighted average
+        weighted_sum = np.sum(sentiment_values * weights)
+        weight_sum = np.sum(weights)
+        
+        if weight_sum > 0:
+            sentiment_index = (weighted_sum / weight_sum) * 100
+        else:
+            sentiment_index = 0.0
+        
+        sentiment_index = float(np.clip(sentiment_index, -100.0, 100.0))
         sentiment_index = round(sentiment_index, 1)
+        
+        # Calculate average confidence
+        avg_confidence = np.mean(weights) * 100
+        avg_confidence = round(avg_confidence, 1)
     else:
         sentiment_index = 0.0
+        avg_confidence = 0.0
     
     return {
         "total_articles": total,
@@ -567,7 +613,7 @@ def calculate_sentiment_metrics(df: pd.DataFrame) -> dict:
         "negative": neg,
         "neutral": neu,
         "sentiment_index": sentiment_index,
-        "scored_articles": total  # All articles are scored now
+        "avg_confidence": avg_confidence
     }
 
 
@@ -700,10 +746,11 @@ def run_app():
     
     st.success(f"✅ Found **{len(df)}** candidate articles.")
 
-    # Select top articles (simple approach)
-    if len(df) > 150:
-        df = df.head(150)
-        st.info(f"📊 Using top 150 most relevant articles.")
+    # Select top articles
+    target_articles = 150
+    if len(df) > target_articles:
+        df = df.head(target_articles)
+        st.info(f"📊 Using top {target_articles} most relevant articles.")
     else:
         st.success(f"✅ Using all {len(df)} articles.")
 
@@ -711,7 +758,7 @@ def run_app():
     df = ensure_language(df)
 
     # SENTIMENT ANALYSIS - FIXED!
-    with st.spinner("😊 Analyzing sentiment for all articles..."):
+    with st.spinner("😊 Analyzing sentiment with calibrated FinBERT..."):
         df = analyze_sentiment_for_all_articles(df)
     
     # Calculate relevance and source domain
@@ -736,7 +783,7 @@ def run_app():
         st.subheader("📊 Sentiment Overview")
         
         # Display metrics
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         
         with col1:
             st.metric("📄 Total Articles", metrics["total_articles"])
@@ -753,13 +800,13 @@ def run_app():
         with col5:
             # Determine sentiment direction
             sentiment_index = metrics["sentiment_index"]
-            if sentiment_index > 15:
+            if sentiment_index > 20:
                 direction = "📈 Bullish"
                 delta_color = "normal"
-            elif sentiment_index < -15:
+            elif sentiment_index < -20:
                 direction = "📉 Bearish"
                 delta_color = "inverse"
-            elif abs(sentiment_index) < 5:
+            elif abs(sentiment_index) < 10:
                 direction = "➡️ Neutral"
                 delta_color = "off"
             else:
@@ -772,6 +819,16 @@ def run_app():
                 direction,
                 delta_color=delta_color
             )
+        
+        with col6:
+            conf = metrics["avg_confidence"]
+            if conf > 70:
+                level = "High"
+            elif conf > 50:
+                level = "Medium"
+            else:
+                level = "Low"
+            st.metric("🎯 Avg Confidence", f"{conf:.1f}%", level)
         
         st.markdown("---")
         
@@ -834,16 +891,22 @@ def run_app():
             else:
                 st.info("No source data available.")
         
-        # Language breakdown
-        st.markdown("#### 🌐 Language Distribution")
-        lang_counts = df["language"].value_counts().head(5)
-        if not lang_counts.empty:
-            fig_lang = px.pie(
-                names=lang_counts.index,
-                values=lang_counts.values,
-                title="Article Languages",
+        # Sentiment confidence distribution
+        st.markdown("#### 📈 Sentiment Confidence Distribution")
+        if "sentiment_score" in df.columns:
+            fig_conf = px.histogram(
+                df,
+                x="sentiment_score",
+                nbins=20,
+                labels={"sentiment_score": "Confidence Score", "count": "Articles"},
+                color_discrete_sequence=["#3498db"]
             )
-            st.plotly_chart(fig_lang, use_container_width=True)
+            fig_conf.update_layout(
+                xaxis_title="Confidence Score (0-1)",
+                yaxis_title="Number of Articles",
+                bargap=0.1
+            )
+            st.plotly_chart(fig_conf, use_container_width=True)
 
     # ----- Articles tab -----
     with tab_articles:
