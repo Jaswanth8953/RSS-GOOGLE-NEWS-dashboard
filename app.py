@@ -726,6 +726,7 @@ def calculate_sentiment_index(df: pd.DataFrame) -> float:
     - Only English articles with positive/neutral/negative labels are used
     - Weight by similarity, recency, and sentiment confidence
     - Output scaled to [-95, 95] to avoid misleading 100% extremes
+    FIXED: uses safe date handling, no .dt error.
     """
     if df.empty or "sentiment_label" not in df.columns:
         return 0.0
@@ -736,9 +737,23 @@ def calculate_sentiment_index(df: pd.DataFrame) -> float:
         return 0.0
 
     today = dt.date.today()
-    df_en["published_dt"] = pd.to_datetime(df_en["published"], errors="coerce")
-    df_en["age_days"] = (today - df_en["published_dt"].dt.date).dt.days
-    df_en["age_days"] = df_en["age_days"].clip(lower=0).fillna(365)
+
+    # Safe datetime conversion (handles strings / None / bad formats)
+    df_en["published_dt"] = pd.to_datetime(df_en["published"], errors="coerce", utc=True)
+    df_en["published_dt"] = df_en["published_dt"].dt.tz_convert(None)
+
+    # Extract date and compute age in days, with a safe fallback
+    published_dates = df_en["published_dt"].dt.date
+
+    def _age(d):
+        if pd.isna(d):
+            return 365
+        try:
+            return (today - d).days
+        except Exception:
+            return 365
+
+    df_en["age_days"] = published_dates.apply(_age)
 
     # recency weight: exponential decay ~2 months
     df_en["recency_weight"] = np.exp(-df_en["age_days"] / 60.0)
@@ -948,184 +963,4 @@ def run_app():
         c_d.metric("Neutral", neu, f"{(neu/total*100):.1f}%" if total else "0.0%")
 
         direction = (
-            "Bullish" if sentiment_index > 0 else "Bearish" if sentiment_index < 0 else "Neutral"
-        )
-        c_e.metric("Sentiment Index", f"{sentiment_index:.1f}", direction)
-
-        st.markdown("---")
-
-        # Pie chart
-        r1c1, r1c2 = st.columns(2)
-        with r1c1:
-            st.markdown("#### Sentiment Distribution (English only + scored)")
-            sentiment_count = df[df["sentiment_label"].isin(["positive", "negative", "neutral"])]["sentiment_label"].value_counts()
-            if sentiment_count.empty:
-                st.info("No English articles with sentiment scored.")
-            else:
-                fig_pie = px.pie(
-                    names=sentiment_count.index,
-                    values=sentiment_count.values,
-                    color=sentiment_count.index,
-                    color_discrete_map={
-                        "positive": "#2ecc71",
-                        "negative": "#e74c3c",
-                        "neutral": "#95a5a6",
-                    },
-                    hole=0.3,
-                )
-                fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-                st.plotly_chart(fig_pie, use_container_width=True)
-
-        # Gauge chart
-        with r1c2:
-            st.markdown("#### Sentiment Index Gauge")
-            gauge_color = "#2ecc71" if sentiment_index > 0 else "#e74c3c"
-            fig_g = go.Figure(
-                go.Indicator(
-                    mode="gauge+number+delta",
-                    value=sentiment_index,
-                    title={"text": "Sentiment Index"},
-                    delta={"reference": 0},
-                    gauge={
-                        "axis": {"range": [-100, 100]},
-                        "bar": {"color": gauge_color},
-                        "steps": [
-                            {"range": [-100, 0], "color": "rgba(231, 76, 60, 0.2)"},
-                            {"range": [0, 100], "color": "rgba(46, 204, 113, 0.2)"},
-                        ],
-                        "threshold": {
-                            "line": {"color": "red", "width": 4},
-                            "thickness": 0.75,
-                            "value": 0,
-                        },
-                    },
-                )
-            )
-            fig_g.update_layout(height=400)
-            st.plotly_chart(fig_g, use_container_width=True)
-
-        # Source + confidence
-        r2c1, r2c2 = st.columns(2)
-        with r2c1:
-            st.markdown("#### Articles by Source")
-            src_counts = df["source_domain"].value_counts()
-            fig_src = px.bar(
-                x=src_counts.values,
-                y=src_counts.index,
-                orientation="h",
-                labels={"x": "Count", "y": "Source"},
-                color=src_counts.values,
-                color_continuous_scale="Viridis",
-            )
-            st.plotly_chart(fig_src, use_container_width=True)
-
-        with r2c2:
-            st.markdown("#### Average Confidence by Sentiment (English only)")
-            df_conf = df[df["sentiment_label"].isin(["positive", "negative", "neutral"])]
-            if df_conf.empty:
-                st.info("No English articles with sentiment scored.")
-            else:
-                avg_conf = (df_conf.groupby("sentiment_label")["sentiment_score"].mean() * 100).round(1)
-                fig_conf = px.bar(
-                    x=avg_conf.index,
-                    y=avg_conf.values,
-                    labels={"x": "Sentiment", "y": "FinBERT confidence (%)"},
-                    color=avg_conf.index,
-                    color_discrete_map={
-                        "positive": "#2ecc71",
-                        "negative": "#e74c3c",
-                        "neutral": "#95a5a6",
-                    },
-                )
-                fig_conf.update_layout(showlegend=False)
-                st.plotly_chart(fig_conf, use_container_width=True)
-
-    # ARTICLES TAB
-    with tab_articles:
-        st.subheader("Articles")
-        sent_filter = st.multiselect(
-            "Filter by sentiment",
-            options=["positive", "negative", "neutral", "not_scored"],
-            default=["positive", "negative", "neutral", "not_scored"],
-        )
-        filtered = df[df["sentiment_label"].isin(sent_filter)].copy()
-        filtered = filtered.sort_values(
-            ["relevance", "sentiment_score"], ascending=[False, False]
-        )
-        for _, row in filtered.iterrows():
-            icon_map = {"positive": "🟢", "negative": "🔴", "neutral": "🔵", "not_scored": "⚪"}
-            icon = icon_map.get(row["sentiment_label"], "⚪")
-            st.markdown(f"**{icon} {row['title']}**")
-            c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-            c1.caption(f"{row['source_domain']} | lang: {row.get('language','unknown')}")
-            c2.caption(f"Relevance: {row['relevance']:.1f}%")
-            if row["sentiment_label"] in ["positive", "negative", "neutral"]:
-                c3.caption(f"Sentiment conf: {row['sentiment_score']*100:.1f}%")
-            else:
-                c3.caption("Sentiment: not scored")
-            c4.markdown(f"[Read →]({row['link']})")
-            if row["summary"]:
-                st.caption(row["summary"][:280] + "…")
-            st.markdown("---")
-
-    # KEYWORDS TAB
-    with tab_keywords:
-        st.subheader("Trending Keywords")
-        keywords = extract_top_keywords(df["title"].tolist(), n=20)
-        if keywords:
-            kw_df = pd.DataFrame(keywords, columns=["Keyword", "Frequency"])
-            col_a, col_b = st.columns(2)
-            with col_a:
-                fig_kw = px.bar(
-                    kw_df,
-                    x="Frequency",
-                    y="Keyword",
-                    orientation="h",
-                    color="Frequency",
-                    color_continuous_scale="Blues",
-                )
-                fig_kw.update_yaxes(categoryorder="total ascending")
-                st.plotly_chart(fig_kw, use_container_width=True)
-            with col_b:
-                fig_tree = px.treemap(
-                    kw_df,
-                    path=["Keyword"],
-                    values="Frequency",
-                    color="Frequency",
-                    color_continuous_scale="Viridis",
-                )
-                st.plotly_chart(fig_tree, use_container_width=True)
-        else:
-            st.info("Not enough data to extract keywords.")
-
-    # DOWNLOAD TAB
-    with tab_download:
-        st.subheader("Download Results")
-        dl_df = df[
-            [
-                "title",
-                "summary",
-                "published",
-                "link",
-                "source_domain",
-                "language",
-                "sentiment_label",
-                "sentiment_score",
-                "relevance",
-                "match_type",
-                "query_term",
-            ]
-        ]
-        csv = dl_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📥 Download CSV",
-            csv,
-            file_name="news_sentiment_results.csv",
-            mime="text/csv",
-        )
-        st.write("### Data Preview")
-        st.dataframe(dl_df, use_container_width=True)
-
-
-if __name__ == "__main__":
-    run_app()
+            "Bullish" if sentiment_index > 0 else "Bearish" if sentimen_
