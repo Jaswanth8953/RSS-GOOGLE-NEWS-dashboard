@@ -47,6 +47,7 @@ GNEWS_MAX_RESULTS = 200
 
 DetectorFactory.seed = 0
 
+
 # ========================== DB SETUP ==========================
 
 def get_connection():
@@ -94,19 +95,24 @@ def safe_execute(query: str, params: tuple = ()):
 
 @st.cache_resource
 def get_openai_client():
+    """
+    Load OpenAI API key from:
+      1) Streamlit secrets -> [openai].api_key
+      2) Environment variable OPENAI_API_KEY
+    """
     api_key = None
-    # Streamlit Cloud secrets: [openai] api_key="..."
+
     if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
         api_key = st.secrets["openai"]["api_key"]
 
-    # Fallback: environment variable (AWS, local)
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY")
 
     if not api_key:
         st.error(
-            "❌ OpenAI API key missing.\n"
-            "Add it to .streamlit/secrets.toml under [openai].api_key\n"
+            "❌ OpenAI API key missing.\n\n"
+            "Add it to .streamlit/secrets.toml under:\n"
+            "[openai]\napi_key = \"YOUR_KEY\"\n\n"
             "or set environment variable OPENAI_API_KEY."
         )
         st.stop()
@@ -158,7 +164,7 @@ def load_finbert():
 
 
 def finbert_sentiment(texts: List[str]) -> List[dict]:
-    """FinBERT with simple calibration to avoid 100% confidence everywhere."""
+    """FinBERT with calibration to avoid everything being 100% positive."""
     if not texts:
         return []
 
@@ -182,14 +188,12 @@ def finbert_sentiment(texts: List[str]) -> List[dict]:
         max_score = float(p[idx])
         label = id2label[idx]
 
-        # Calibration: low confidence → neutral
         if max_score < 0.60:
             label = "neutral"
             score = 0.50
         else:
             score = min(max_score, 0.95)
 
-        # If positive but strong negative probability → neutral
         if label == "positive" and p[0] > 0.25:
             label = "neutral"
             score = 0.50
@@ -257,7 +261,6 @@ def fetch_rss_articles() -> int:
 
 
 def fetch_gdelt_articles(query: str, start: dt.date, end: dt.date) -> int:
-    """Fetch from GDELT DOC API for this query and date range."""
     new_count = 0
     start_str = start.strftime("%Y%m%d000000")
     end_str = end.strftime("%Y%m%d235959")
@@ -344,7 +347,7 @@ def fetch_gnews_articles(query: str, start: dt.date, end: dt.date) -> int:
     return new_count
 
 
-# ========================== LOAD + ENSURE EMBEDDINGS ==========================
+# ========================== LOAD + EMBEDDINGS ==========================
 
 def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     cur = conn.cursor()
@@ -378,7 +381,6 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
 
 
 def ensure_embeddings(df: pd.DataFrame) -> None:
-    """Compute embeddings only for rows that are missing them."""
     for _, row in df.iterrows():
         emb_str = row.get("embedding")
         if emb_str in (None, "", "NULL", "null"):
@@ -402,13 +404,11 @@ def hybrid_search(query: str, start: dt.date, end: dt.date, top_k: int) -> pd.Da
     if df.empty:
         return df
 
-    # Ensure embeddings for rows in this date range
     ensure_embeddings(df)
     df = load_articles_for_range(start, end)
     if df.empty:
         return df
 
-    # Semantic similarity
     q_emb = np.array(get_embedding(query))
     sims = []
     for _, row in df.iterrows():
@@ -419,7 +419,6 @@ def hybrid_search(query: str, start: dt.date, end: dt.date, top_k: int) -> pd.Da
             sims.append(0.0)
     df["similarity"] = sims
 
-    # Keyword check
     q_lower = query.lower().strip()
     kw_mask = (
         df["title"].str.lower().str.contains(q_lower, na=False)
@@ -445,7 +444,6 @@ def hybrid_search(query: str, start: dt.date, end: dt.date, top_k: int) -> pd.Da
 # ========================== LLM QUERY EXPANSION ==========================
 
 def expand_query(query: str) -> List[str]:
-    """Use GPT-4o-mini to create related search terms."""
     client = get_openai_client()
     prompt = f"""
 You expand financial news search queries.
@@ -470,11 +468,9 @@ Return ONLY a JSON list of strings, e.g.:
         )
         content = resp.choices[0].message.content.strip()
 
-        # Try to parse JSON directly
         try:
             expansions = json.loads(content)
         except Exception:
-            # Or extract [ ... ] from text
             match = re.search(r"\[.*\]", content, re.DOTALL)
             if not match:
                 raise ValueError("No JSON list in response")
@@ -486,7 +482,6 @@ Return ONLY a JSON list of strings, e.g.:
         expansions = [str(t) for t in expansions if isinstance(t, str)]
         all_terms = [query] + expansions
 
-        # Deduplicate while keeping order
         seen = set()
         cleaned = []
         for t in all_terms:
@@ -506,10 +501,13 @@ Return ONLY a JSON list of strings, e.g.:
         return [query]
 
 
-# ========================== LLM ARTICLE FILTER ==========================
+# ========================== LLM ARTICLE FILTER (ROBUST) ==========================
 
 def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Let LLM choose genuinely relevant subset from hybrid search results."""
+    """
+    Robust LLM-based relevance selector.
+    If LLM returns invalid JSON → recover gracefully.
+    """
     if df.empty:
         return df
 
@@ -517,48 +515,66 @@ def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
     df_small = df.head(200).copy()
 
     items = [
-        {
-            "id": int(row["id"]),
-            "title": row["title"],
-            "summary": (row["summary"] or "")[:250],
-        }
-        for _, row in df_small.iterrows()
+        {"id": int(r["id"]), "title": r["title"], "summary": (r["summary"] or "")[:250]}
+        for _, r in df_small.iterrows()
     ]
 
     prompt = f"""
-You are filtering financial news articles.
+You MUST return JSON ONLY.
 
-User topic: "{query}"
+Topic: "{query}"
 
-Below is a list of articles with id, title, summary.
-Return ONLY a JSON list of the IDs that are clearly relevant.
-Do not include any explanation text.
+Below is a list of articles (id, title, summary).
+Return ONLY a JSON list of IDs that are relevant.
+
+Example:
+[1, 5, 7, 10]
 
 Articles:
 {json.dumps(items, indent=2)}
 """
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=400,
+            max_tokens=300,
         )
         content = resp.choices[0].message.content.strip()
-        selected_ids = json.loads(content)
-        if not isinstance(selected_ids, list):
-            raise ValueError("Not a list")
-        selected_ids = set(int(i) for i in selected_ids)
-        return df_small[df_small["id"].isin(selected_ids)]
+
+        # 1) Direct JSON parse
+        try:
+            ids = json.loads(content)
+            if isinstance(ids, list):
+                ids = [int(x) for x in ids]
+                return df_small[df_small["id"].isin(ids)]
+        except Exception:
+            pass
+
+        # 2) Extract JSON list from text
+        match = re.search(r"\[.*?\]", content, re.DOTALL)
+        if match:
+            try:
+                ids = json.loads(match.group(0))
+                if isinstance(ids, list):
+                    ids = [int(x) for x in ids]
+                    return df_small[df_small["id"].isin(ids)]
+            except Exception:
+                pass
+
+        # 3) Fallback
+        st.warning("⚠️ LLM returned invalid JSON. Using unfiltered top candidate articles.")
+        return df_small
+
     except Exception as e:
-        st.warning(f"⚠️ LLM article filtering failed, using all candidates. ({e})")
+        st.warning(f"⚠️ LLM filtering crashed: {e}")
         return df_small
 
 
 # ========================== SENTIMENT INDEX ==========================
 
 def calculate_sentiment_index(df: pd.DataFrame) -> float:
-    """Compute composite index only on EN articles."""
     if df.empty or "sentiment_label" not in df.columns:
         return 0.0
 
@@ -601,7 +617,7 @@ def run_app():
 
     st.title("📊 Financial News Sentiment Dashboard")
 
-    # SIDEBAR
+    # ---------- SIDEBAR ----------
     with st.sidebar:
         st.header("Update Sources")
 
@@ -625,7 +641,7 @@ def run_app():
             50,
         )
 
-    # MAIN AREA
+    # ---------- MAIN AREA ----------
     st.markdown("### 🔍 Search Topic")
     col1, col2, col3 = st.columns([1, 3, 1])
     with col2:
@@ -649,7 +665,7 @@ def run_app():
     st.write("🔍 **Expanded terms used:**")
     st.write(", ".join(expanded_terms))
 
-    # Extra sources (GDELT + GNews)
+    # Extra sources
     if use_gdelt or use_gnews:
         with st.spinner("Fetching additional articles from GDELT / Google News..."):
             total_added = 0
@@ -660,7 +676,7 @@ def run_app():
                     total_added += fetch_gnews_articles(q, start_date, end_date)
         st.success(f"Added {total_added} extra articles for this topic.")
 
-    # Hybrid search for each expanded term
+    # Hybrid search
     with st.spinner("Running hybrid keyword + semantic search..."):
         dfs = []
         for q in expanded_terms:
@@ -687,10 +703,10 @@ def run_app():
 
     st.success(f"✅ LLM kept **{len(df)}** highly relevant articles.")
 
-    # Ensure language info
+    # Ensure language
     df = ensure_language(df)
 
-    # Sentiment (FinBERT only on English)
+    # Sentiment
     with st.spinner("Running FinBERT sentiment (English only)..."):
         df["sentiment_label"] = "not_scored"
         df["sentiment_score"] = np.nan
@@ -714,8 +730,7 @@ def run_app():
 
     sent_index = calculate_sentiment_index(df)
 
-    # ================== TABS ==================
-
+    # ---------- TABS ----------
     tab_dash, tab_articles, tab_keywords, tab_download = st.tabs(
         ["📈 Dashboard", "📰 Articles", "🔑 Keywords", "📥 Download"]
     )
@@ -751,6 +766,7 @@ def run_app():
         ]["sentiment_label"].value_counts()
 
         if not dist.empty:
+            st.markdown("#### Sentiment Distribution")
             fig_pie = px.pie(
                 names=dist.index,
                 values=dist.values,
