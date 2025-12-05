@@ -3,7 +3,7 @@ import json
 import sqlite3
 import time
 import datetime as dt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -85,10 +85,32 @@ def get_connection():
         """
     )
     
+    # Ensure all columns exist (backward compatibility)
+    try:
+        conn.execute("ALTER TABLE articles ADD COLUMN precomputed_sentiment_label TEXT")
+    except:
+        pass  # Column already exists
+    
+    try:
+        conn.execute("ALTER TABLE articles ADD COLUMN precomputed_sentiment_score REAL")
+    except:
+        pass
+    
+    try:
+        conn.execute("ALTER TABLE articles ADD COLUMN embedding_generated INTEGER DEFAULT 0")
+    except:
+        pass
+    
+    try:
+        conn.execute("ALTER TABLE articles ADD COLUMN sentiment_computed INTEGER DEFAULT 0")
+    except:
+        pass
+    
     conn.execute("CREATE INDEX IF NOT EXISTS idx_published ON articles(published);")
     conn.commit()
     return conn
 
+# Global connection
 conn = get_connection()
 
 
@@ -297,29 +319,43 @@ def precompute_embeddings_for_new_articles():
 
 def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, title, summary, published, link, source, content, 
-               embedding, language, precomputed_sentiment_label, 
-               precomputed_sentiment_score
-        FROM articles
-        WHERE date(published) BETWEEN ? AND ?
-        AND language = 'en'
-        """,
-        (start.isoformat(), end.isoformat()),
-    )
+    
+    # Check if columns exist
+    cur.execute("PRAGMA table_info(articles)")
+    columns = [row[1] for row in cur.fetchall()]
+    
+    # Build select query based on available columns
+    select_fields = ["id", "title", "summary", "published", "link", "source", "content", 
+                     "embedding", "language"]
+    
+    # Add precomputed sentiment columns if they exist
+    if 'precomputed_sentiment_label' in columns:
+        select_fields.append("precomputed_sentiment_label")
+    if 'precomputed_sentiment_score' in columns:
+        select_fields.append("precomputed_sentiment_score")
+    
+    query = f"""
+    SELECT {', '.join(select_fields)}
+    FROM articles
+    WHERE date(published) BETWEEN ? AND ?
+    AND language = 'en'
+    """
+    
+    cur.execute(query, (start.isoformat(), end.isoformat()))
     rows = cur.fetchall()
+    
     if not rows:
         return pd.DataFrame()
     
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "id", "title", "summary", "published", "link", 
-            "source", "content", "embedding", "language",
-            "precomputed_sentiment_label", "precomputed_sentiment_score"
-        ],
-    )
+    # Create DataFrame with available columns
+    df = pd.DataFrame(rows, columns=select_fields)
+    
+    # Ensure expected columns exist
+    if 'precomputed_sentiment_label' not in df.columns:
+        df['precomputed_sentiment_label'] = None
+    if 'precomputed_sentiment_score' not in df.columns:
+        df['precomputed_sentiment_score'] = None
+    
     return df
 
 
@@ -343,7 +379,7 @@ def hybrid_search(
     # Calculate similarities
     sims = []
     for _, row in df.iterrows():
-        if row["embedding"] and row["embedding"] != "null":
+        if row["embedding"] and isinstance(row["embedding"], str) and row["embedding"] != "null":
             try:
                 emb_vec = np.array(json.loads(row["embedding"]))
                 sim = cosine_similarity(q_emb, emb_vec)
@@ -483,12 +519,29 @@ def calculate_weighted_sentiment_index(df: pd.DataFrame, query: str) -> dict:
     # Sentiment values
     sentiment_map = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
     
-    if 'precomputed_sentiment_label' in df.columns and not df['precomputed_sentiment_label'].isna().all():
-        sentiment_values = df['precomputed_sentiment_label'].map(sentiment_map).fillna(0).values
-        sentiment_scores = df['precomputed_sentiment_score'].fillna(0.5).values
-    else:
+    # Check if we have sentiment data
+    if 'sentiment_label' in df.columns:
+        # Use real-time computed sentiment
         sentiment_values = df['sentiment_label'].map(sentiment_map).fillna(0).values
-        sentiment_scores = df['sentiment_score'].fillna(0.5).values
+        if 'sentiment_score' in df.columns:
+            sentiment_scores = df['sentiment_score'].fillna(0.5).values
+        else:
+            sentiment_scores = np.ones(len(df)) * 0.5
+    elif 'precomputed_sentiment_label' in df.columns:
+        # Use precomputed sentiment
+        sentiment_values = df['precomputed_sentiment_label'].map(sentiment_map).fillna(0).values
+        if 'precomputed_sentiment_score' in df.columns:
+            sentiment_scores = df['precomputed_sentiment_score'].fillna(0.5).values
+        else:
+            sentiment_scores = np.ones(len(df)) * 0.5
+    else:
+        # No sentiment data
+        return {
+            "index": 0.0,
+            "confidence": 0.0,
+            "total_articles": len(df),
+            "weighted_articles": 0
+        }
     
     # Apply confidence weighting
     weighted_sentiments = sentiment_values * sentiment_scores * weights
@@ -609,7 +662,9 @@ def run_app():
     # Step 3: Sentiment Analysis (use precomputed if available)
     with st.spinner("Analyzing sentiment..."):
         # Check if we have precomputed sentiment
-        if 'precomputed_sentiment_label' in df.columns and not df['precomputed_sentiment_label'].isna().all():
+        has_precomputed = 'precomputed_sentiment_label' in df.columns and not df['precomputed_sentiment_label'].isna().all()
+        
+        if has_precomputed:
             # Use precomputed
             df["sentiment_label"] = df["precomputed_sentiment_label"]
             df["sentiment_score"] = df["precomputed_sentiment_score"]
@@ -654,38 +709,39 @@ def run_app():
         st.metric("Confidence", f"{conf:.1f}%", level)
     
     # Sentiment distribution
-    counts = df["sentiment_label"].value_counts()
-    total = len(df)
-    
-    if total > 0:
-        col_a, col_b = st.columns(2)
+    if 'sentiment_label' in df.columns:
+        counts = df["sentiment_label"].value_counts()
+        total = len(df)
         
-        with col_a:
-            st.markdown("#### Sentiment Distribution")
-            fig_pie = px.pie(
-                names=counts.index,
-                values=counts.values,
-                color=counts.index,
-                color_discrete_map={
-                    "positive": "#2ecc71",
-                    "negative": "#e74c3c",
-                    "neutral": "#95a5a6",
-                },
-                hole=0.3,
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-        
-        with col_b:
-            st.markdown("#### Articles by Source")
-            src_counts = df["source_domain"].value_counts().head(10)
-            if not src_counts.empty:
-                fig_bar = px.bar(
-                    x=src_counts.values,
-                    y=src_counts.index,
-                    orientation='h',
-                    labels={'x': 'Count', 'y': 'Source'},
+        if total > 0:
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.markdown("#### Sentiment Distribution")
+                fig_pie = px.pie(
+                    names=counts.index,
+                    values=counts.values,
+                    color=counts.index,
+                    color_discrete_map={
+                        "positive": "#2ecc71",
+                        "negative": "#e74c3c",
+                        "neutral": "#95a5a6",
+                    },
+                    hole=0.3,
                 )
-                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with col_b:
+                st.markdown("#### Articles by Source")
+                src_counts = df["source_domain"].value_counts().head(10)
+                if not src_counts.empty:
+                    fig_bar = px.bar(
+                        x=src_counts.values,
+                        y=src_counts.index,
+                        orientation='h',
+                        labels={'x': 'Count', 'y': 'Source'},
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
     
     # Articles list
     st.markdown("---")
@@ -695,16 +751,19 @@ def run_app():
     df_display = df.sort_values("relevance", ascending=False).head(50)
     
     for _, row in df_display.iterrows():
-        icon = {"positive": "🟢", "negative": "🔴", "neutral": "🔵"}[row["sentiment_label"]]
+        icon = {"positive": "🟢", "negative": "🔴", "neutral": "🔵"}.get(row.get("sentiment_label", "neutral"), "🔵")
         
         st.markdown(f"**{icon} {row['title']}**")
         cols = st.columns([3, 2, 2, 1])
-        cols[0].caption(f"📰 {row['source_domain']}")
-        cols[1].caption(f"🎯 Relevance: {row['relevance']:.1f}%")
-        cols[2].caption(f"😊 {row['sentiment_label']} ({row['sentiment_score']*100:.1f}%)")
+        cols[0].caption(f"📰 {row.get('source_domain', 'Unknown')}")
+        cols[1].caption(f"🎯 Relevance: {row.get('relevance', 0):.1f}%")
+        if 'sentiment_label' in row and 'sentiment_score' in row:
+            cols[2].caption(f"😊 {row['sentiment_label']} ({row['sentiment_score']*100:.1f}%)")
+        else:
+            cols[2].caption("😊 Sentiment: N/A")
         cols[3].markdown(f"[Read →]({row['link']})")
         
-        if row["summary"]:
+        if row.get("summary"):
             st.caption(row["summary"][:250] + "...")
         
         st.markdown("---")
@@ -713,8 +772,12 @@ def run_app():
     st.markdown("---")
     st.subheader("📥 Download Results")
     
-    download_df = df[["title", "summary", "published", "link", "source_domain", 
-                      "sentiment_label", "sentiment_score", "relevance"]].copy()
+    # Prepare download DataFrame
+    download_columns = ["title", "summary", "published", "link", "source_domain", "relevance"]
+    if 'sentiment_label' in df.columns:
+        download_columns.extend(["sentiment_label", "sentiment_score"])
+    
+    download_df = df[download_columns].copy()
     
     csv = download_df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -726,6 +789,4 @@ def run_app():
 
 
 if __name__ == "__main__":
-    # Initialize database
-    conn = get_connection()
     run_app()
