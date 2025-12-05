@@ -19,7 +19,8 @@ import plotly.graph_objects as go
 from gnews import GNews
 from openai import OpenAI
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
+from langdetect import detect, DetectorFactory
+from langdetect.lang_detect_exception import LangDetectException
 
 # ========================== CONFIG ==========================
 
@@ -39,11 +40,12 @@ RSS_FEEDS = [
 OPENAI_EMBED_MODEL = "text-embedding-3-small"
 FINBERT_MODEL = "ProsusAI/finbert"
 
-MIN_SIMILARITY = 0.30          # a bit lower → more matches
+MIN_SIMILARITY = 0.30          # similarity threshold
 MAX_ARTICLES_DEFAULT = 200
 GDELT_MAX_RECORDS = 250
 GNEWS_MAX_RESULTS = 200
 
+DetectorFactory.seed = 0
 
 # ========================== DB SETUP (LOCK-FREE) ==========================
 
@@ -51,6 +53,7 @@ def get_connection():
     """
     Single shared SQLite connection.
     WAL mode + timeout to avoid 'database is locked'.
+    Also adds extra columns for language and precomputed sentiment.
     """
     conn = sqlite3.connect(
         DB_PATH,
@@ -64,6 +67,7 @@ def get_connection():
     conn.execute("PRAGMA temp_store=MEMORY;")
     conn.execute("PRAGMA cache_size = -20000;")  # use memory cache
 
+    # Base table (will not modify existing)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS articles (
@@ -74,10 +78,31 @@ def get_connection():
             link TEXT UNIQUE,
             source TEXT,
             content TEXT,
-            embedding TEXT
+            embedding TEXT,
+            language TEXT DEFAULT 'unknown',
+            precomputed_sentiment_label TEXT,
+            precomputed_sentiment_score REAL,
+            embedding_generated INTEGER DEFAULT 0,
+            sentiment_computed INTEGER DEFAULT 0
         );
         """
     )
+
+    # Backward compatibility: add missing columns if old DB existed
+    for col_def in [
+        "ALTER TABLE articles ADD COLUMN language TEXT DEFAULT 'unknown'",
+        "ALTER TABLE articles ADD COLUMN precomputed_sentiment_label TEXT",
+        "ALTER TABLE articles ADD COLUMN precomputed_sentiment_score REAL",
+        "ALTER TABLE articles ADD COLUMN embedding_generated INTEGER DEFAULT 0",
+        "ALTER TABLE articles ADD COLUMN sentiment_computed INTEGER DEFAULT 0",
+    ]:
+        try:
+            conn.execute(col_def)
+        except Exception:
+            pass
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_published ON articles(published);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_language ON articles(language);")
     conn.commit()
     return conn
 
@@ -90,7 +115,7 @@ def safe_execute(query: str, params: tuple = ()):
     Safer wrapper for INSERT/UPDATE with retry if DB is locked.
     """
     max_retries = 10
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         try:
             cur = conn.cursor()
             cur.execute(query, params)
@@ -123,12 +148,53 @@ def get_openai_client():
         api_key = os.getenv("OPENAI_API_KEY")
 
     if not api_key:
-        raise ValueError(
-            "OpenAI API key not found. "
-            "Set it in Streamlit secrets or as environment variable OPENAI_API_KEY."
+        st.error(
+            "❌ OpenAI API key not found.\n\n"
+            "Set it in `.streamlit/secrets.toml` under [openai].api_key\n"
+            "or as environment variable OPENAI_API_KEY."
         )
+        st.stop()
 
     return OpenAI(api_key=api_key)
+
+
+# ========================== LANGUAGE DETECTION ==========================
+
+def detect_language(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return "unknown"
+    try:
+        return detect(text)
+    except LangDetectException:
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def ensure_language_for_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For rows with unknown/empty language, detect language using title+summary+content,
+    update DB, and return updated df.
+    """
+    if "language" not in df.columns:
+        df["language"] = "unknown"
+
+    mask = df["language"].isna() | df["language"].eq("") | df["language"].eq("unknown")
+    if not mask.any():
+        return df
+
+    subset = df[mask].copy()
+    for idx, row in subset.iterrows():
+        text = f"{row.get('title','')} {row.get('summary','')} {row.get('content','')}"
+        lang = detect_language(text)
+        df.at[idx, "language"] = lang
+        try:
+            safe_execute("UPDATE articles SET language = ? WHERE id = ?", (lang, int(row["id"])))
+        except Exception:
+            pass
+
+    return df
 
 
 # ========================== FINBERT SENTIMENT ==========================
@@ -145,9 +211,10 @@ def load_finbert():
 
 def finbert_sentiment(texts: List[str]) -> List[dict]:
     """
-    Run FinBERT and apply a small calibration:
-    - If max probability < 0.55 → treat as neutral.
-    This helps avoid "everything is positive".
+    Run FinBERT and apply calibration to avoid unrealistic 100% predictions.
+    - If max probability < 0.60 → treat as neutral, score = 0.50
+    - Cap max confidence at 0.95
+    - If positive but negative prob also high → neutral
     """
     if not texts:
         return []
@@ -170,12 +237,20 @@ def finbert_sentiment(texts: List[str]) -> List[dict]:
         idx = int(np.argmax(p))
         max_score = float(p[idx])
         base_label = id2label[idx]
-        # calibration
-        if max_score < 0.55:
+
+        if max_score < 0.60:
             label = "neutral"
+            score = 0.50
         else:
             label = base_label
-        results.append({"label": label, "score": max_score})
+            score = min(max_score, 0.95)
+
+        # If positive but negative also high → neutral
+        if label == "positive" and p[0] > 0.25:
+            label = "neutral"
+            score = 0.50
+
+        results.append({"label": label, "score": score})
     return results
 
 
@@ -184,7 +259,7 @@ def finbert_sentiment(texts: List[str]) -> List[dict]:
 def get_embedding(text: str) -> List[float]:
     client = get_openai_client()
     # short, cleaned text for cheaper, faster embeddings
-    text = text.replace("\n", " ")
+    text = (text or "").replace("\n", " ")
     if len(text) > 500:
         text = text[:500]
     emb = client.embeddings.create(
@@ -369,7 +444,8 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, title, summary, published, link, source, content, embedding
+        SELECT id, title, summary, published, link, source, content, embedding, language,
+               precomputed_sentiment_label, precomputed_sentiment_score
         FROM articles
         WHERE date(published) BETWEEN ? AND ?
         """,
@@ -389,6 +465,9 @@ def load_articles_for_range(start: dt.date, end: dt.date) -> pd.DataFrame:
             "source",
             "content",
             "embedding",
+            "language",
+            "precomputed_sentiment_label",
+            "precomputed_sentiment_score",
         ],
     )
     return df
@@ -400,15 +479,19 @@ def ensure_embeddings(df_ids_title_summary: pd.DataFrame):
     Uses safe_execute to avoid DB locking.
     """
     for _, row in df_ids_title_summary.iterrows():
-        if row["embedding"] is None:
+        emb_str = row.get("embedding")
+        if emb_str in (None, "", "NULL", "null"):
             text = (row["title"] or "") + " " + (row["summary"] or "")
             if not text.strip():
                 continue
             emb = get_embedding(text)
-            safe_execute(
-                "UPDATE articles SET embedding = ? WHERE id = ?",
-                (json.dumps(emb), int(row["id"])),
-            )
+            try:
+                safe_execute(
+                    "UPDATE articles SET embedding = ?, embedding_generated = 1 WHERE id = ?",
+                    (json.dumps(emb), int(row["id"])),
+                )
+            except Exception:
+                pass
 
 
 def hybrid_search(
@@ -420,14 +503,14 @@ def hybrid_search(
 ) -> pd.DataFrame:
     """
     Hybrid keyword + semantic search within date range.
-    Also returns 'match_type' = keyword / semantic / keyword+semantic.
+    Returns a DataFrame with 'similarity' and 'match_type'.
     """
     df = load_articles_for_range(start, end)
     if df.empty:
         return df
 
     df["embedding"] = df["embedding"].apply(
-        lambda x: None if x in (None, "", "NULL") else x
+        lambda x: None if x in (None, "", "NULL", "null") else x
     )
 
     # only compute embeddings for rows that are missing
@@ -441,8 +524,11 @@ def hybrid_search(
     q_emb = np.array(get_embedding(query))
     sims = []
     for _, row in df.iterrows():
-        emb_vec = np.array(json.loads(row["embedding"]))
-        sims.append(cosine_similarity(q_emb, emb_vec))
+        try:
+            emb_vec = np.array(json.loads(row["embedding"]))
+            sims.append(cosine_similarity(q_emb, emb_vec))
+        except Exception:
+            sims.append(0.0)
     df["similarity"] = sims
 
     # keyword mask
@@ -456,9 +542,8 @@ def hybrid_search(
     sem_mask = df["similarity"] >= min_sim
 
     if kw_mask.any() and sem_mask.any():
-        mask = kw_mask & sem_mask
         df["match_type"] = np.where(
-            mask,
+            kw_mask & sem_mask,
             "keyword+semantic",
             np.where(kw_mask, "keyword", "semantic"),
         )
@@ -507,24 +592,29 @@ Return ONLY a valid JSON list of strings, like:
                 {"role": "system", "content": "You generate semantic search expansions."},
                 {"role": "user", "content": prompt},
             ],
+            temperature=0.3,
         )
         content = resp.choices[0].message.content.strip()
-        expansions = json.loads(content)
-        expansions = [str(t) for t in expansions if isinstance(t, str)]
+        terms = json.loads(content)
+        terms = [str(t) for t in terms if isinstance(t, str)]
+
         # always include original query as first term
-        all_terms = [query] + expansions
+        all_terms = [query] + terms
+
         # deduplicate while preserving order
         seen = set()
         cleaned = []
         for t in all_terms:
-            t = t.strip()
-            if not t:
+            t_clean = t.strip()
+            if not t_clean:
                 continue
-            if t.lower() in seen:
+            low = t_clean.lower()
+            if low in seen:
                 continue
-            seen.add(t.lower())
-            cleaned.append(t)
-        return cleaned
+            seen.add(low)
+            cleaned.append(t_clean)
+
+        return cleaned[:12]
     except Exception:
         # fallback: just the original term
         return [query]
@@ -543,7 +633,7 @@ def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
 
     client = get_openai_client()
 
-    # cap to avoid huge prompts (AWS cost + speed)
+    # cap to avoid huge prompts (cost + speed)
     df_small = df.head(200).copy()
 
     # Prepare lightweight list
@@ -578,6 +668,7 @@ Articles:
                 {"role": "system", "content": "You select relevant financial news articles."},
                 {"role": "user", "content": prompt},
             ],
+            temperature=0.2,
         )
         content = resp.choices[0].message.content.strip()
         selected_ids = json.loads(content)
@@ -630,12 +721,44 @@ def extract_top_keywords(titles: List[str], n: int = 20) -> List[Tuple[str, int]
 
 
 def calculate_sentiment_index(df: pd.DataFrame) -> float:
-    pos = len(df[df["sentiment_label"] == "positive"])
-    neg = len(df[df["sentiment_label"] == "negative"])
-    total = len(df)
-    if total == 0:
+    """
+    Weighted sentiment index:
+    - Only English articles with positive/neutral/negative labels are used
+    - Weight by similarity, recency, and sentiment confidence
+    - Output scaled to [-95, 95] to avoid misleading 100% extremes
+    """
+    if df.empty or "sentiment_label" not in df.columns:
         return 0.0
-    index = ((pos - neg) / total) * 100
+
+    # Only English with scored labels
+    df_en = df[(df["language"] == "en") & df["sentiment_label"].isin(["positive", "neutral", "negative"])].copy()
+    if df_en.empty:
+        return 0.0
+
+    today = dt.date.today()
+    df_en["published_dt"] = pd.to_datetime(df_en["published"], errors="coerce")
+    df_en["age_days"] = (today - df_en["published_dt"].dt.date).dt.days
+    df_en["age_days"] = df_en["age_days"].clip(lower=0).fillna(365)
+
+    # recency weight: exponential decay ~2 months
+    df_en["recency_weight"] = np.exp(-df_en["age_days"] / 60.0)
+
+    # similarity + confidence
+    df_en["sim_weight"] = df_en["similarity"].clip(lower=0.1)
+    df_en["conf_weight"] = df_en["sentiment_score"].fillna(0.5).clip(lower=0.3)
+
+    df_en["weight"] = df_en["recency_weight"] * df_en["sim_weight"] * df_en["conf_weight"]
+
+    sent_map = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
+    df_en["sent_value"] = df_en["sentiment_label"].map(sent_map).fillna(0.0)
+
+    num = (df_en["sent_value"] * df_en["weight"]).sum()
+    den = df_en["weight"].sum()
+    if den == 0:
+        return 0.0
+
+    index = (num / den) * 100.0
+    index = float(np.clip(index, -95.0, 95.0))
     return round(index, 2)
 
 
@@ -779,13 +902,25 @@ def run_app():
 
     st.success(f"✅ LLM selected **{len(df)}** final articles for analysis.")
 
-    # SENTIMENT
-    with st.spinner("Running FinBERT sentiment classification…"):
-        texts = df["content"].fillna(df["summary"]).tolist()
-        sents = finbert_sentiment(texts)
+    # Ensure language for these articles
+    df = ensure_language_for_df(df)
 
-    df["sentiment_label"] = [s["label"] for s in sents]
-    df["sentiment_score"] = [s["score"] for s in sents]
+    # SENTIMENT (English only)
+    with st.spinner("Running FinBERT sentiment classification on English articles…"):
+        # initialize
+        df["sentiment_label"] = "not_scored"
+        df["sentiment_score"] = np.nan
+
+        mask_en = df["language"] == "en"
+        df_en = df[mask_en].copy()
+
+        if not df_en.empty:
+            texts = df_en["content"].fillna(df_en["summary"]).tolist()
+            texts = [(t or "")[:1000] for t in texts]
+            sents = finbert_sentiment(texts)
+            df.loc[mask_en, "sentiment_label"] = [s["label"] for s in sents]
+            df.loc[mask_en, "sentiment_score"] = [s["score"] for s in sents]
+
     df["relevance"] = (df["similarity"] * 100).round(1)
     df["source_domain"] = df["source"].fillna("").replace("", "unknown")
 
@@ -822,21 +957,24 @@ def run_app():
         # Pie chart
         r1c1, r1c2 = st.columns(2)
         with r1c1:
-            st.markdown("#### Sentiment Distribution")
-            sentiment_count = df["sentiment_label"].value_counts()
-            fig_pie = px.pie(
-                names=sentiment_count.index,
-                values=sentiment_count.values,
-                color=sentiment_count.index,
-                color_discrete_map={
-                    "positive": "#2ecc71",
-                    "negative": "#e74c3c",
-                    "neutral": "#95a5a6",
-                },
-                hole=0.3,
-            )
-            fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.markdown("#### Sentiment Distribution (English only + scored)")
+            sentiment_count = df[df["sentiment_label"].isin(["positive", "negative", "neutral"])]["sentiment_label"].value_counts()
+            if sentiment_count.empty:
+                st.info("No English articles with sentiment scored.")
+            else:
+                fig_pie = px.pie(
+                    names=sentiment_count.index,
+                    values=sentiment_count.values,
+                    color=sentiment_count.index,
+                    color_discrete_map={
+                        "positive": "#2ecc71",
+                        "negative": "#e74c3c",
+                        "neutral": "#95a5a6",
+                    },
+                    hole=0.3,
+                )
+                fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig_pie, use_container_width=True)
 
         # Gauge chart
         with r1c2:
@@ -882,41 +1020,49 @@ def run_app():
             st.plotly_chart(fig_src, use_container_width=True)
 
         with r2c2:
-            st.markdown("#### Average Confidence by Sentiment")
-            avg_conf = (df.groupby("sentiment_label")["sentiment_score"].mean() * 100).round(1)
-            fig_conf = px.bar(
-                x=avg_conf.index,
-                y=avg_conf.values,
-                labels={"x": "Sentiment", "y": "FinBERT confidence (%)"},
-                color=avg_conf.index,
-                color_discrete_map={
-                    "positive": "#2ecc71",
-                    "negative": "#e74c3c",
-                    "neutral": "#95a5a6",
-                },
-            )
-            fig_conf.update_layout(showlegend=False)
-            st.plotly_chart(fig_conf, use_container_width=True)
+            st.markdown("#### Average Confidence by Sentiment (English only)")
+            df_conf = df[df["sentiment_label"].isin(["positive", "negative", "neutral"])]
+            if df_conf.empty:
+                st.info("No English articles with sentiment scored.")
+            else:
+                avg_conf = (df_conf.groupby("sentiment_label")["sentiment_score"].mean() * 100).round(1)
+                fig_conf = px.bar(
+                    x=avg_conf.index,
+                    y=avg_conf.values,
+                    labels={"x": "Sentiment", "y": "FinBERT confidence (%)"},
+                    color=avg_conf.index,
+                    color_discrete_map={
+                        "positive": "#2ecc71",
+                        "negative": "#e74c3c",
+                        "neutral": "#95a5a6",
+                    },
+                )
+                fig_conf.update_layout(showlegend=False)
+                st.plotly_chart(fig_conf, use_container_width=True)
 
     # ARTICLES TAB
     with tab_articles:
         st.subheader("Articles")
         sent_filter = st.multiselect(
             "Filter by sentiment",
-            options=["positive", "negative", "neutral"],
-            default=["positive", "negative", "neutral"],
+            options=["positive", "negative", "neutral", "not_scored"],
+            default=["positive", "negative", "neutral", "not_scored"],
         )
         filtered = df[df["sentiment_label"].isin(sent_filter)].copy()
         filtered = filtered.sort_values(
             ["relevance", "sentiment_score"], ascending=[False, False]
         )
         for _, row in filtered.iterrows():
-            icon = {"positive": "🟢", "negative": "🔴", "neutral": "🔵"}[row["sentiment_label"]]
+            icon_map = {"positive": "🟢", "negative": "🔴", "neutral": "🔵", "not_scored": "⚪"}
+            icon = icon_map.get(row["sentiment_label"], "⚪")
             st.markdown(f"**{icon} {row['title']}**")
             c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-            c1.caption(row["source_domain"])
+            c1.caption(f"{row['source_domain']} | lang: {row.get('language','unknown')}")
             c2.caption(f"Relevance: {row['relevance']:.1f}%")
-            c3.caption(f"Sentiment conf: {row['sentiment_score']*100:.1f}%")
+            if row["sentiment_label"] in ["positive", "negative", "neutral"]:
+                c3.caption(f"Sentiment conf: {row['sentiment_score']*100:.1f}%")
+            else:
+                c3.caption("Sentiment: not scored")
             c4.markdown(f"[Read →]({row['link']})")
             if row["summary"]:
                 st.caption(row["summary"][:280] + "…")
@@ -962,6 +1108,7 @@ def run_app():
                 "published",
                 "link",
                 "source_domain",
+                "language",
                 "sentiment_label",
                 "sentiment_score",
                 "relevance",
