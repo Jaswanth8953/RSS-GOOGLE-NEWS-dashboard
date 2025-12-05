@@ -14,7 +14,6 @@ import torch
 from collections import Counter
 import re
 import plotly.express as px
-import plotly.graph_objects as go
 
 from gnews import GNews
 from openai import OpenAI
@@ -143,7 +142,7 @@ def ensure_language(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ========================== FIXED FINBERT SENTIMENT ==========================
+# ========================== SIMPLE FINBERT SENTIMENT ==========================
 
 @st.cache_resource
 def load_finbert():
@@ -155,59 +154,51 @@ def load_finbert():
     return tokenizer, model, device
 
 
-def finbert_sentiment(texts: List[str]) -> List[dict]:
-    """COMPLETELY REVISED FinBERT sentiment - fixes the bug"""
+def finbert_sentiment_simple(texts: List[str]) -> List[dict]:
+    """Simple, reliable sentiment analysis"""
     if not texts:
         return []
     
     tokenizer, model, device = load_finbert()
     
-    # Process in batches to avoid memory issues
-    batch_size = 32
-    all_results = []
+    # Clean texts
+    texts = [str(t)[:500] if t else "" for t in texts]
     
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
+    try:
+        enc = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+        ).to(device)
         
-        # Clean texts
-        batch_texts = [str(t)[:1000] if t else "" for t in batch_texts]
+        with torch.no_grad():
+            outputs = model(**enc)
+            probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
         
-        try:
-            enc = tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=256,
-                return_tensors="pt",
-            ).to(device)
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
+        results = []
+        
+        for p in probs:
+            idx = int(np.argmax(p))
+            max_score = float(p[idx])
+            label = id2label[idx]
             
-            with torch.no_grad():
-                outputs = model(**enc)
-                probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
+            # Very simple logic - no complex calibration
+            if max_score > 0.60:  # Confident prediction
+                score = max_score
+            else:  # Low confidence = neutral
+                label = "neutral"
+                score = 0.5
             
-            id2label = {0: "negative", 1: "neutral", 2: "positive"}
-            
-            for p in probs:
-                idx = int(np.argmax(p))
-                max_score = float(p[idx])
-                label = id2label[idx]
-                
-                # SIMPLE LOGIC - NO OVERLY AGGRESSIVE NEUTRAL CONVERSION
-                # Only force neutral if confidence is very low
-                if max_score < 0.50:  # Reduced threshold
-                    label = "neutral"
-                    score = 0.5
-                else:
-                    score = max_score
-                
-                all_results.append({"label": label, "score": score})
-                
-        except Exception as e:
-            # If batch fails, assign neutral
-            for _ in batch_texts:
-                all_results.append({"label": "neutral", "score": 0.5})
-    
-    return all_results
+            results.append({"label": label, "score": score})
+        
+        return results
+        
+    except Exception:
+        # If anything fails, return neutral for all
+        return [{"label": "neutral", "score": 0.5} for _ in texts]
 
 
 # ========================== EMBEDDINGS ==========================
@@ -453,13 +444,9 @@ def hybrid_search(query: str, start: dt.date, end: dt.date, top_k: int) -> pd.Da
 
 def expand_query(query: str) -> List[str]:
     client = get_openai_client()
-    prompt = f"""Generate financial news search terms for: "{query}"
+    prompt = f"""Generate 8-10 financial news search terms related to: "{query}"
 
-Return JSON array of 8-12 terms.
-
-Example: ["term1", "term2", "term3"]
-
-Your JSON:"""
+Return ONLY a JSON array of strings like ["term1", "term2", "term3"]"""
 
     try:
         resp = client.chat.completions.create(
@@ -469,17 +456,17 @@ Your JSON:"""
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=300,
+            max_tokens=200,
         )
         content = resp.choices[0].message.content.strip()
         
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1].rsplit("\n", 1)[0]
+        # Clean response
+        content = content.replace('```json', '').replace('```', '').strip()
         
         expansions = json.loads(content)
         
         if not isinstance(expansions, list):
-            raise ValueError("Not a list")
+            return [query]
         
         expansions = [str(t).strip() for t in expansions if t and str(t).strip()]
         
@@ -492,65 +479,96 @@ Your JSON:"""
                 seen.add(key)
                 cleaned.append(t)
         
-        return cleaned[:12]
+        return cleaned[:10]
         
     except Exception:
         return [query]
 
 
-# ========================== SIMPLE LLM FILTER ==========================
+# ========================== SENTIMENT CALCULATION ==========================
 
-def llm_select_articles(query: str, df: pd.DataFrame) -> pd.DataFrame:
-    """Simple filter - returns reasonable number of articles"""
-    if len(df) <= 50:
-        return df
+def analyze_sentiment_for_all_articles(df: pd.DataFrame) -> pd.DataFrame:
+    """Analyze sentiment for ALL articles (not just English)"""
+    df_result = df.copy()
     
-    # Just use similarity ranking
-    filtered = df.head(150).copy()
-    return filtered
+    # Initialize sentiment columns
+    df_result["sentiment_label"] = "neutral"
+    df_result["sentiment_score"] = 0.5
+    
+    # Prepare texts for sentiment analysis
+    texts = []
+    indices = []
+    
+    for idx, row in df_result.iterrows():
+        # Use title + summary for context
+        text = f"{row.get('title', '')}. {row.get('summary', '')}"
+        if text.strip() and len(text.strip()) > 10:
+            texts.append(text[:400])  # Limit length
+            indices.append(idx)
+    
+    # If we have texts to analyze
+    if texts:
+        try:
+            # Analyze in small batches
+            batch_size = 32
+            all_sentiments = []
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i+batch_size]
+                sentiments = finbert_sentiment_simple(batch)
+                all_sentiments.extend(sentiments)
+                time.sleep(0.05)  # Small delay
+            
+            # Apply sentiments to DataFrame
+            for i, idx in enumerate(indices):
+                if i < len(all_sentiments):
+                    df_result.at[idx, "sentiment_label"] = all_sentiments[i]["label"]
+                    df_result.at[idx, "sentiment_score"] = all_sentiments[i]["score"]
+        
+        except Exception as e:
+            st.warning(f"⚠️ Sentiment analysis issue. Using neutral defaults. Error: {str(e)[:50]}")
+    
+    return df_result
 
 
-# ========================== FIXED SENTIMENT INDEX ==========================
-
-def calculate_sentiment_index(df: pd.DataFrame) -> Tuple[float, dict]:
-    """Calculate sentiment index and return with counts"""
+def calculate_sentiment_metrics(df: pd.DataFrame) -> dict:
+    """Calculate all sentiment metrics"""
     if df.empty:
-        return 0.0, {"positive": 0, "negative": 0, "neutral": 0, "total": 0}
+        return {
+            "total_articles": 0,
+            "positive": 0,
+            "negative": 0,
+            "neutral": 0,
+            "sentiment_index": 0.0,
+            "scored_articles": 0
+        }
     
-    # Only scored English articles
-    scored_df = df[
-        (df["language"] == "en") & 
-        df["sentiment_label"].isin(["positive", "neutral", "negative"])
-    ].copy()
+    total = len(df)
     
-    if scored_df.empty:
-        return 0.0, {"positive": 0, "negative": 0, "neutral": 0, "total": 0}
-    
-    # Counts
-    counts = scored_df["sentiment_label"].value_counts()
+    # Count sentiments
+    counts = df["sentiment_label"].value_counts()
     pos = int(counts.get("positive", 0))
     neg = int(counts.get("negative", 0))
     neu = int(counts.get("neutral", 0))
-    total_scored = pos + neg + neu
     
-    # Sentiment index (only if we have scored articles)
-    if total_scored > 0:
-        sent_map = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
-        scored_df["sent_value"] = scored_df["sentiment_label"].map(sent_map).fillna(0.0)
-        
-        # Weight by confidence if available
-        if "sentiment_score" in scored_df.columns:
-            weights = scored_df["sentiment_score"].fillna(0.5)
-            index = (scored_df["sent_value"] * weights).sum() / weights.sum() * 100
-        else:
-            index = scored_df["sent_value"].mean() * 100
-        
-        index = float(np.clip(index, -100.0, 100.0))
-        index = round(index, 1)
+    # Calculate sentiment index
+    if total > 0:
+        # Simple calculation: (positive% - negative%) * 100
+        pos_pct = (pos / total) * 100
+        neg_pct = (neg / total) * 100
+        sentiment_index = (pos_pct - neg_pct)
+        sentiment_index = round(sentiment_index, 1)
     else:
-        index = 0.0
+        sentiment_index = 0.0
     
-    return index, {"positive": pos, "negative": neg, "neutral": neu, "total": total_scored}
+    return {
+        "total_articles": total,
+        "positive": pos,
+        "negative": neg,
+        "neutral": neu,
+        "sentiment_index": sentiment_index,
+        "scored_articles": total  # All articles are scored now
+    }
 
 
 # ========================== KEYWORDS ==========================
@@ -616,7 +634,7 @@ def run_app():
     st.markdown("### 🔍 Search Topic")
     
     query = st.text_input(
-        "Enter topic (e.g., 'US Tech', 'Germany', 'oil')",
+        "Enter topic (e.g., 'Germany', 'US Tech', 'Oil Prices')",
         placeholder="Type your topic here...",
         label_visibility="collapsed"
     )
@@ -625,6 +643,15 @@ def run_app():
 
     if not analyze_clicked or not query.strip():
         st.info("👆 Enter a topic and click **Analyze** to begin.")
+        
+        # Show database stats
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM articles")
+        total = cur.fetchone()[0]
+        
+        st.markdown("---")
+        st.metric("📊 Total Articles in Database", f"{total:,}")
+        
         return
 
     # ========== MAIN ANALYSIS ==========
@@ -634,14 +661,14 @@ def run_app():
         expanded_terms = expand_query(query)
     
     if len(expanded_terms) > 1:
-        st.markdown("### 🔍 Expanded terms used:")
-        st.write(", ".join(expanded_terms[:8]) + ("..." if len(expanded_terms) > 8 else ""))
+        st.markdown("### 🔍 Expanded terms:")
+        st.write(", ".join(expanded_terms[:6]) + ("..." if len(expanded_terms) > 6 else ""))
 
     # Fetch additional articles
     total_added = 0
     if use_gdelt or use_gnews:
         with st.spinner("🌐 Fetching additional articles..."):
-            for q in expanded_terms[:5]:
+            for q in expanded_terms[:4]:  # Limit to 4 terms
                 if use_gdelt:
                     added = fetch_gdelt_articles(q, start_date, end_date)
                     total_added += added
@@ -668,57 +695,26 @@ def run_app():
         df = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["link"])
         
         if df.empty:
-            st.error("❌ No articles found.")
+            st.error("❌ No articles found after deduplication.")
             return
     
     st.success(f"✅ Found **{len(df)}** candidate articles.")
 
-    # Article Selection
-    if len(df) > 50:
-        with st.spinner("🤖 Selecting relevant articles..."):
-            df = llm_select_articles(query, df)
-        st.info(f"📊 Using {len(df)} most relevant articles.")
+    # Select top articles (simple approach)
+    if len(df) > 150:
+        df = df.head(150)
+        st.info(f"📊 Using top 150 most relevant articles.")
     else:
         st.success(f"✅ Using all {len(df)} articles.")
 
     # Language detection
     df = ensure_language(df)
 
-    # FIXED: Sentiment Analysis
-    with st.spinner("😊 Analyzing sentiment..."):
-        # Initialize columns
-        df["sentiment_label"] = "not_scored"
-        df["sentiment_score"] = 0.5
-        
-        # Only analyze English articles
-        mask_en = df["language"] == "en"
-        df_en = df[mask_en].copy()
-        
-        if not df_en.empty:
-            # Prepare texts
-            texts = []
-            indices = []
-            for idx, row in df_en.iterrows():
-                # Use title + summary
-                text = f"{row.get('title', '')}. {row.get('summary', '')}"
-                if text.strip():
-                    texts.append(text[:800])  # Limit length
-                    indices.append(idx)
-            
-            if texts:
-                # Run sentiment analysis
-                try:
-                    sents = finbert_sentiment(texts)
-                    
-                    # Apply results
-                    for i, idx in enumerate(indices):
-                        if i < len(sents):
-                            df.at[idx, "sentiment_label"] = sents[i]["label"]
-                            df.at[idx, "sentiment_score"] = sents[i]["score"]
-                except Exception as e:
-                    st.warning(f"⚠️ Sentiment analysis had issues. Using neutral for all.")
-
-    # Calculate relevance and source
+    # SENTIMENT ANALYSIS - FIXED!
+    with st.spinner("😊 Analyzing sentiment for all articles..."):
+        df = analyze_sentiment_for_all_articles(df)
+    
+    # Calculate relevance and source domain
     df["relevance"] = (df["similarity"] * 100).round(1)
     df["source_domain"] = df["source"].apply(
         lambda x: x.split("//")[-1].split("/")[0]
@@ -726,14 +722,9 @@ def run_app():
         else (str(x)[:30] if x else "unknown")
     )
 
-    # Calculate sentiment index and counts
-    sent_index, sent_counts = calculate_sentiment_index(df)
-    total_articles = len(df)
-    pos = sent_counts["positive"]
-    neg = sent_counts["negative"]
-    neu = sent_counts["neutral"]
-    total_scored = sent_counts["total"]
-
+    # Calculate sentiment metrics
+    metrics = calculate_sentiment_metrics(df)
+    
     # ================== TABS ==================
     
     tab_dash, tab_articles, tab_keywords, tab_download = st.tabs(
@@ -744,98 +735,97 @@ def run_app():
     with tab_dash:
         st.subheader("📊 Sentiment Overview")
         
-        # Display metrics - FIXED
+        # Display metrics
         col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            st.metric("📄 Total Articles", total_articles)
+            st.metric("📄 Total Articles", metrics["total_articles"])
         
         with col2:
-            st.metric("🟢 Positive", pos)
+            st.metric("🟢 Positive", metrics["positive"])
         
         with col3:
-            st.metric("🔴 Negative", neg)
+            st.metric("🔴 Negative", metrics["negative"])
         
         with col4:
-            st.metric("🔵 Neutral", neu)
+            st.metric("🔵 Neutral", metrics["neutral"])
         
         with col5:
-            # Determine direction
-            if sent_index > 15:
+            # Determine sentiment direction
+            sentiment_index = metrics["sentiment_index"]
+            if sentiment_index > 15:
                 direction = "📈 Bullish"
                 delta_color = "normal"
-            elif sent_index < -15:
+            elif sentiment_index < -15:
                 direction = "📉 Bearish"
                 delta_color = "inverse"
-            elif abs(sent_index) < 5:
+            elif abs(sentiment_index) < 5:
                 direction = "➡️ Neutral"
                 delta_color = "off"
             else:
-                direction = "Slightly Bullish" if sent_index > 0 else "Slightly Bearish"
-                delta_color = "normal" if sent_index > 0 else "inverse"
+                direction = "Slightly Bullish" if sentiment_index > 0 else "Slightly Bearish"
+                delta_color = "normal" if sentiment_index > 0 else "inverse"
             
             st.metric(
                 "📊 Sentiment Index", 
-                f"{sent_index:.1f}", 
+                f"{sentiment_index:.1f}", 
                 direction,
                 delta_color=delta_color
             )
         
         st.markdown("---")
         
-        # Charts - FIXED
+        # Charts
         col_chart1, col_chart2 = st.columns(2)
         
         with col_chart1:
             st.markdown("#### 📊 Sentiment Distribution")
-            # Only show scored sentiments
-            scored_sentiments = df[
-                df["sentiment_label"].isin(["positive", "negative", "neutral"])
-            ]["sentiment_label"]
             
-            if not scored_sentiments.empty:
-                dist = scored_sentiments.value_counts()
-                
-                # Create pie chart
-                fig_pie = px.pie(
-                    names=dist.index,
-                    values=dist.values,
-                    color=dist.index,
-                    color_discrete_map={
-                        "positive": "#2ecc71",
-                        "negative": "#e74c3c",
-                        "neutral": "#3498db",
-                    },
-                    hole=0.4,
+            # Get sentiment counts for chart
+            sentiment_counts = pd.Series({
+                "Positive": metrics["positive"],
+                "Negative": metrics["negative"],
+                "Neutral": metrics["neutral"]
+            })
+            
+            # Create pie chart
+            fig_pie = px.pie(
+                names=sentiment_counts.index,
+                values=sentiment_counts.values,
+                color=sentiment_counts.index,
+                color_discrete_map={
+                    "Positive": "#2ecc71",
+                    "Negative": "#e74c3c",
+                    "Neutral": "#3498db",
+                },
+                hole=0.4,
+            )
+            fig_pie.update_traces(
+                textposition="inside",
+                textinfo="percent+label",
+                hovertemplate="<b>%{label}</b><br>%{value} articles<br>%{percent}"
+            )
+            fig_pie.update_layout(
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=-0.1,
+                    xanchor="center",
+                    x=0.5
                 )
-                fig_pie.update_traces(
-                    textposition="inside",
-                    textinfo="percent+label",
-                    hovertemplate="<b>%{label}</b><br>%{value} articles<br>%{percent}"
-                )
-                fig_pie.update_layout(
-                    showlegend=True,
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=-0.1,
-                        xanchor="center",
-                        x=0.5
-                    )
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
-            else:
-                st.info("No sentiment-scored articles available.")
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
         
         with col_chart2:
-            st.markdown("#### 📰 Articles by Source")
-            src_counts = df["source_domain"].value_counts().head(10)
+            st.markdown("#### 📰 Top Sources")
+            src_counts = df["source_domain"].value_counts().head(8)
             if not src_counts.empty:
                 fig_src = px.bar(
                     x=src_counts.values,
                     y=src_counts.index,
                     orientation="h",
-                    labels={"x": "Count", "y": "Source"},
+                    labels={"x": "Articles", "y": "Source"},
                     color=src_counts.values,
                     color_continuous_scale="Blues",
                 )
@@ -843,6 +833,17 @@ def run_app():
                 st.plotly_chart(fig_src, use_container_width=True)
             else:
                 st.info("No source data available.")
+        
+        # Language breakdown
+        st.markdown("#### 🌐 Language Distribution")
+        lang_counts = df["language"].value_counts().head(5)
+        if not lang_counts.empty:
+            fig_lang = px.pie(
+                names=lang_counts.index,
+                values=lang_counts.values,
+                title="Article Languages",
+            )
+            st.plotly_chart(fig_lang, use_container_width=True)
 
     # ----- Articles tab -----
     with tab_articles:
@@ -853,14 +854,14 @@ def run_app():
         with col_filter1:
             sent_filter = st.multiselect(
                 "Filter by sentiment",
-                options=["positive", "negative", "neutral", "not_scored"],
+                options=["positive", "negative", "neutral"],
                 default=["positive", "negative", "neutral"],
             )
         
         with col_filter2:
             sort_by = st.selectbox(
                 "Sort by",
-                ["Relevance", "Date", "Sentiment"],
+                ["Relevance", "Date", "Sentiment Confidence"],
                 index=0
             )
         
@@ -871,35 +872,39 @@ def run_app():
             df_art = df_art.sort_values("relevance", ascending=False)
         elif sort_by == "Date":
             df_art = df_art.sort_values("published", ascending=False)
-        elif sort_by == "Sentiment":
+        elif sort_by == "Sentiment Confidence":
             df_art = df_art.sort_values("sentiment_score", ascending=False)
         
-        # Display
+        # Display articles
         for idx, row in df_art.iterrows():
             icon_map = {
                 "positive": "🟢",
                 "negative": "🔴",
                 "neutral": "🔵",
-                "not_scored": "⚪",
             }
-            icon = icon_map.get(row["sentiment_label"], "⚪")
+            icon = icon_map.get(row["sentiment_label"], "🔵")
             
             with st.container():
-                st.markdown(f"**{icon} {row['title']}**")
+                col_title, col_link = st.columns([5, 1])
+                with col_title:
+                    st.markdown(f"**{icon} {row['title']}**")
+                with col_link:
+                    st.markdown(f"[📖 Read]({row['link']})")
                 
-                cols = st.columns([3, 2, 2, 1])
-                cols[0].caption(f"📰 {row['source_domain']}")
-                cols[1].caption(f"🎯 {row['relevance']:.1f}% relevant")
-                if row["sentiment_label"] in ["positive", "negative", "neutral"]:
+                # Metadata
+                col_meta1, col_meta2, col_meta3 = st.columns(3)
+                with col_meta1:
+                    st.caption(f"📰 {row['source_domain']}")
+                with col_meta2:
+                    st.caption(f"🎯 {row['relevance']:.1f}% relevant")
+                with col_meta3:
                     score_pct = row.get('sentiment_score', 0.5) * 100
-                    cols[2].caption(f"{row['sentiment_label'].title()} ({score_pct:.0f}%)")
-                else:
-                    cols[2].caption("Not scored")
-                cols[3].markdown(f"[📖 Read]({row['link']})")
+                    st.caption(f"{row['sentiment_label'].title()} ({score_pct:.0f}%)")
                 
+                # Summary
                 if row.get("summary"):
                     summary = str(row["summary"])
-                    st.caption(summary[:250] + ("..." if len(summary) > 250 else ""))
+                    st.caption(summary[:200] + ("..." if len(summary) > 200 else ""))
                 
                 st.markdown("---")
 
@@ -907,27 +912,37 @@ def run_app():
     with tab_keywords:
         st.subheader("🔑 Trending Keywords")
         
-        keywords = extract_top_keywords(df["title"].tolist(), n=20)
+        keywords = extract_top_keywords(df["title"].tolist(), n=15)
         
         if keywords:
-            kw_df = pd.DataFrame(keywords[:15], columns=["Keyword", "Frequency"])
-            st.dataframe(kw_df, use_container_width=True)
+            # Display as metrics
+            st.markdown("#### Top Keywords in Titles")
+            cols = st.columns(3)
+            for i, (word, freq) in enumerate(keywords[:9]):
+                with cols[i % 3]:
+                    st.metric(word.title(), freq)
             
+            # Bar chart
+            st.markdown("#### Keyword Frequency")
+            kw_df = pd.DataFrame(keywords[:12], columns=["Keyword", "Frequency"])
             fig_kw = px.bar(
                 kw_df,
                 x="Frequency",
                 y="Keyword",
                 orientation="h",
+                color="Frequency",
+                color_continuous_scale="Viridis",
             )
             fig_kw.update_yaxes(categoryorder="total ascending")
             st.plotly_chart(fig_kw, use_container_width=True)
         else:
-            st.info("Not enough data for keywords.")
+            st.info("Not enough data for keyword analysis.")
 
     # ----- Download tab -----
     with tab_download:
         st.subheader("📥 Download Results")
         
+        # Prepare data for download
         dl_df = df[
             [
                 "title",
@@ -944,18 +959,35 @@ def run_app():
             ]
         ].copy()
         
+        # Format date for better readability
+        dl_df["published"] = pd.to_datetime(dl_df["published"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+        
+        # Download button
         csv = dl_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "📥 Download CSV",
             csv,
-            file_name=f"sentiment_{query.replace(' ', '_')}.csv",
+            file_name=f"sentiment_{query.replace(' ', '_')}_{dt.date.today()}.csv",
             mime="text/csv",
             use_container_width=True
         )
         
         st.markdown("---")
-        st.markdown("#### Preview")
-        st.dataframe(dl_df.head(10), use_container_width=True)
+        st.markdown("#### 📋 Data Preview")
+        st.dataframe(
+            dl_df.head(10),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "link": st.column_config.LinkColumn("Link"),
+                "sentiment_score": st.column_config.ProgressColumn(
+                    "Sentiment Score",
+                    format="%.2f",
+                    min_value=0,
+                    max_value=1,
+                )
+            }
+        )
 
 
 if __name__ == "__main__":
